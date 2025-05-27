@@ -136,13 +136,22 @@ class MultiTaskLoss(nn.Module):
         
         batch_size, max_atoms, num_classes = pred.shape
         
+        # Debug: Check target values
+        # print(f"Target min: {target.min()}, max: {target.max()}")
+        # print(f"Unique targets: {torch.unique(target)}")
+        
+        # Replace -1 (padding) with 0, which will be masked out
+        valid_target = torch.clamp(target, min=0, max=num_classes-1)
+        
         # Reshape for cross entropy
         pred_flat = pred.view(-1, num_classes)
-        target_flat = target.view(-1)
+        target_flat = valid_target.view(-1)
         mask_flat = mask.view(-1)
         
         # Compute loss
-        loss = self.ce_loss(pred_flat, target_flat)  # (batch_size * max_atoms,)
+        loss = F.cross_entropy(pred_flat, target_flat, reduction='none')
+        
+        # Apply mask to ignore padding
         masked_loss = loss * mask_flat
         
         num_valid = mask_flat.sum()

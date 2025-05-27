@@ -1,7 +1,7 @@
 """
 Hardware optimization utilities for NMR-ChemBERTa
 """
-
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple

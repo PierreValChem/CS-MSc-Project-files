@@ -49,7 +49,7 @@ class TrainingConfig:
     # Loss weights
     nmr_loss_weight: float = 1.0
     position_loss_weight: float = 1.0
-    atom_type_loss_weight: float = 1.0
+    atom_type_loss_weight: float = 0.0
     smiles_position_loss_weight: float = 0.5
 
 
@@ -58,7 +58,7 @@ class HardwareConfig:
     """Hardware optimization configuration"""
     device: str = 'auto'  # 'auto', 'cpu', 'cuda', 'mps'
     mixed_precision: bool = True
-    compile_model: bool = True  # PyTorch 2.0 compilation
+    compile_model: bool = False  # PyTorch 2.0 compilation
     use_distributed: bool = False
     gradient_checkpointing: bool = False
     channels_last: bool = True  # Memory format optimization
