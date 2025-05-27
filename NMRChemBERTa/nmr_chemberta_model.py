@@ -1,242 +1,129 @@
 """
-NMR-ChemBERTa Model Architecture
-Combines ChemBERTa with 3D coordinates and NMR data
+Refactored NMR-ChemBERTa Model
+Using modular components for better maintainability
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig
-import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 import logging
+
+from model_components import (
+    PositionalEncoding3D,
+    NMREncoder,
+    AtomFeatureEncoder,
+    CrossAttentionLayer,
+    TaskHeads,
+    FeatureFusion,
+    apply_gradient_checkpointing
+)
 
 logger = logging.getLogger(__name__)
 
 
-class PositionalEncoding3D(nn.Module):
-    """3D positional encoding for molecular coordinates"""
-    
-    def __init__(self, d_model: int, max_atoms: int = 200):
-        super().__init__()
-        self.d_model = d_model
-        
-        # Learnable positional encoding based on 3D coordinates
-        self.coord_proj = nn.Linear(3, d_model // 4)
-        self.distance_proj = nn.Linear(1, d_model // 4)
-        self.angle_proj = nn.Linear(1, d_model // 4)
-        self.dihedral_proj = nn.Linear(1, d_model // 4)
-        
-    def forward(self, coords: torch.Tensor, atom_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            coords: (batch_size, max_atoms, 3)
-            atom_mask: (batch_size, max_atoms)
-        Returns:
-            pos_encoding: (batch_size, max_atoms, d_model)
-        """
-        batch_size, max_atoms, _ = coords.shape
-        
-        # Direct coordinate encoding
-        coord_enc = self.coord_proj(coords)  # (B, N, d/4)
-        
-        # Calculate pairwise distances
-        distances = torch.cdist(coords, coords)  # (B, N, N)
-        
-        # Get nearest neighbor distances (excluding self)
-        distances_masked = distances + (1 - atom_mask.unsqueeze(-1)) * 1e6
-        nearest_dist, _ = torch.min(distances_masked + torch.eye(max_atoms).to(coords.device) * 1e6, dim=-1)
-        dist_enc = self.distance_proj(nearest_dist.unsqueeze(-1))  # (B, N, d/4)
-        
-        # Placeholder for angles and dihedrals (simplified)
-        angles = torch.zeros(batch_size, max_atoms, 1).to(coords.device)
-        dihedrals = torch.zeros(batch_size, max_atoms, 1).to(coords.device)
-        
-        angle_enc = self.angle_proj(angles)  # (B, N, d/4)
-        dihedral_enc = self.dihedral_proj(dihedrals)  # (B, N, d/4)
-        
-        # Concatenate all encodings
-        pos_encoding = torch.cat([coord_enc, dist_enc, angle_enc, dihedral_enc], dim=-1)
-        
-        return pos_encoding * atom_mask.unsqueeze(-1)
-
-
-class NMREncoder(nn.Module):
-    """Encoder for NMR spectroscopic data"""
-    
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # Separate encoders for H and C NMR
-        self.h_shift_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, hidden_dim // 2)
-        )
-        
-        self.c_shift_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, hidden_dim // 2)
-        )
-        
-        # Combine H and C features
-        self.nmr_fusion = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-    def forward(self, h_shifts: torch.Tensor, c_shifts: torch.Tensor,
-                h_mask: torch.Tensor, c_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h_shifts: (batch_size, max_atoms) - H NMR chemical shifts
-            c_shifts: (batch_size, max_atoms) - C NMR chemical shifts
-            h_mask: (batch_size, max_atoms) - mask for H NMR data
-            c_mask: (batch_size, max_atoms) - mask for C NMR data
-        Returns:
-            nmr_features: (batch_size, max_atoms, hidden_dim)
-        """
-        # Encode chemical shifts
-        h_features = self.h_shift_encoder(h_shifts.unsqueeze(-1))  # (B, N, h/2)
-        c_features = self.c_shift_encoder(c_shifts.unsqueeze(-1))  # (B, N, h/2)
-        
-        # Apply masks
-        h_features = h_features * h_mask.unsqueeze(-1)
-        c_features = c_features * c_mask.unsqueeze(-1)
-        
-        # Concatenate and fuse
-        nmr_features = torch.cat([h_features, c_features], dim=-1)  # (B, N, h)
-        nmr_features = self.nmr_fusion(nmr_features)
-        
-        return nmr_features
-
-
-class AtomFeatureEncoder(nn.Module):
-    """Encoder for atom-level features"""
-    
-    def __init__(self, num_atom_types: int, hidden_dim: int):
-        super().__init__()
-        self.atom_embedding = nn.Embedding(num_atom_types + 1, hidden_dim, padding_idx=-1)
-        self.atom_encoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-    def forward(self, atom_types: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            atom_types: (batch_size, max_atoms) - atom type indices
-        Returns:
-            atom_features: (batch_size, max_atoms, hidden_dim)
-        """
-        atom_embeddings = self.atom_embedding(atom_types)
-        atom_features = self.atom_encoder(atom_embeddings)
-        return atom_features
-
-
-class CrossAttentionLayer(nn.Module):
-    """Cross-attention between SMILES tokens and atom features"""
-    
-    def __init__(self, hidden_dim: int, num_heads: int = 8):
-        super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim * 4, hidden_dim)
-        )
-        
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Cross-attention
-        attn_output, _ = self.multihead_attn(query, key, value, key_padding_mask=attn_mask)
-        query = self.norm1(query + attn_output)
-        
-        # FFN
-        ffn_output = self.ffn(query)
-        output = self.norm2(query + ffn_output)
-        
-        return output
-
-
 class NMRChemBERTa(nn.Module):
-    """Main model combining ChemBERTa with NMR and 3D structural data"""
+    """
+    Main NMR-ChemBERTa model combining:
+    - Pre-trained ChemBERTa for SMILES understanding
+    - 3D structural information
+    - NMR spectroscopic data
+    """
     
-    def __init__(self, 
-                 chemberta_name: str = 'seyonec/ChemBERTa-zinc-base-v1',
-                 hidden_dim: int = 768,
-                 num_atom_types: int = 10,
-                 max_atoms: int = 200,
-                 dropout: float = 0.1):
+    def __init__(self, config):
         super().__init__()
         
-        self.hidden_dim = hidden_dim
-        self.max_atoms = max_atoms
+        self.config = config
+        self.hidden_dim = config.model.hidden_dim
+        self.max_atoms = config.model.max_atoms
         
         # Load pre-trained ChemBERTa
-        self.chemberta = AutoModel.from_pretrained(chemberta_name)
-        self.chemberta_config = AutoConfig.from_pretrained(chemberta_name)
+        self._setup_chemberta()
         
-        # Freeze ChemBERTa layers initially (can be unfrozen during fine-tuning)
-        for param in self.chemberta.parameters():
-            param.requires_grad = False
+        # Initialize feature encoders
+        self._setup_encoders()
         
-        # Feature encoders
-        self.position_encoder = PositionalEncoding3D(hidden_dim, max_atoms)
-        self.nmr_encoder = NMREncoder(hidden_dim)
-        self.atom_encoder = AtomFeatureEncoder(num_atom_types, hidden_dim)
+        # Initialize cross-attention layers
+        self._setup_cross_attention()
         
-        # Feature fusion
-        self.feature_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+        # Initialize task heads
+        self._setup_task_heads()
+        
+        # Apply gradient checkpointing if requested
+        if config.hardware.gradient_checkpointing:
+            self._apply_gradient_checkpointing()
+    
+    def _setup_chemberta(self):
+        """Initialize ChemBERTa backbone"""
+        self.chemberta = AutoModel.from_pretrained(self.config.model.chemberta_name)
+        self.chemberta_config = AutoConfig.from_pretrained(self.config.model.chemberta_name)
+        
+        # Freeze ChemBERTa if requested
+        if self.config.model.freeze_chemberta:
+            for param in self.chemberta.parameters():
+                param.requires_grad = False
+            logger.info("ChemBERTa parameters frozen")
+        else:
+            logger.info("ChemBERTa parameters will be fine-tuned")
+    
+    def _setup_encoders(self):
+        """Initialize feature encoders"""
+        self.position_encoder = PositionalEncoding3D(
+            self.hidden_dim, 
+            self.max_atoms
         )
         
-        # Cross-attention layers
-        self.smiles_to_atoms = CrossAttentionLayer(hidden_dim)
-        self.atoms_to_smiles = CrossAttentionLayer(hidden_dim)
-        
-        # Task-specific heads
-        self.nmr_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 2)  # Predict H and C shifts
+        self.nmr_encoder = NMREncoder(
+            self.hidden_dim,
+            self.config.model.dropout
         )
         
-        self.position_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 3)  # Predict x, y, z coordinates
+        self.atom_encoder = AtomFeatureEncoder(
+            self.config.model.num_atom_types,
+            self.hidden_dim,
+            self.config.model.dropout
         )
         
-        self.atom_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_atom_types)  # Classify atom type
+        # Feature fusion layer
+        self.feature_fusion = FeatureFusion(
+            input_dim=self.hidden_dim * 3,
+            output_dim=self.hidden_dim,
+            dropout=self.config.model.dropout
+        )
+    
+    def _setup_cross_attention(self):
+        """Initialize cross-attention layers"""
+        self.smiles_to_atoms = CrossAttentionLayer(
+            self.hidden_dim,
+            self.config.model.num_attention_heads,
+            self.config.model.dropout
         )
         
-        # SMILES position predictor (maps atoms to SMILES token positions)
-        self.smiles_position_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)  # Predict position in SMILES
+        self.atoms_to_smiles = CrossAttentionLayer(
+            self.hidden_dim,
+            self.config.model.num_attention_heads,
+            self.config.model.dropout
         )
-        
+    
+    def _setup_task_heads(self):
+        """Initialize task-specific prediction heads"""
+        self.task_heads = TaskHeads(
+            self.hidden_dim,
+            self.config.model.num_atom_types,
+            self.config.model.dropout
+        )
+    
+    def _apply_gradient_checkpointing(self):
+        """Apply gradient checkpointing to save memory"""
+        layers_to_checkpoint = [
+            'position_encoder',
+            'nmr_encoder',
+            'smiles_to_atoms',
+            'atoms_to_smiles'
+        ]
+        apply_gradient_checkpointing(self, layers_to_checkpoint)
+        logger.info("Gradient checkpointing applied")
+    
     def forward(self, 
                 input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
@@ -258,46 +145,82 @@ class NMRChemBERTa(nn.Module):
         Returns:
             Dict containing predictions for various tasks
         """
-        batch_size = input_ids.shape[0]
-        
         # 1. Get ChemBERTa embeddings for SMILES
+        smiles_embeddings = self._encode_smiles(input_ids, attention_mask)
+        
+        # 2. Encode atom-level features
+        atom_representations = self._encode_atoms(
+            coords, atom_types, atom_mask, nmr_features
+        )
+        
+        # 3. Cross-attention between SMILES and atoms
+        enhanced_smiles, enhanced_atoms = self._cross_attention(
+            smiles_embeddings, atom_representations, attention_mask, atom_mask
+        )
+        
+        # 4. Make predictions using task heads
+        predictions = self.task_heads(enhanced_atoms)
+        
+        # 5. Add representations to output
+        predictions.update({
+            'atom_representations': enhanced_atoms,
+            'smiles_representations': enhanced_smiles
+        })
+        
+        return predictions
+    
+    def _encode_smiles(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Encode SMILES using ChemBERTa"""
         chemberta_outputs = self.chemberta(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
-        smiles_embeddings = chemberta_outputs.last_hidden_state  # (B, seq_len, hidden)
+        return chemberta_outputs.last_hidden_state
+    
+    def _encode_atoms(self, 
+                     coords: torch.Tensor,
+                     atom_types: torch.Tensor,
+                     atom_mask: torch.Tensor,
+                     nmr_features: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Encode atom-level features"""
+        # Encode 3D positions
+        position_features = self.position_encoder(coords, atom_mask)
         
-        # 2. Encode 3D positions
-        position_features = self.position_encoder(coords, atom_mask)  # (B, max_atoms, hidden)
-        
-        # 3. Encode NMR data
+        # Encode NMR data
         nmr_encoded = self.nmr_encoder(
             nmr_features['h_shifts'],
             nmr_features['c_shifts'],
             nmr_features['h_mask'],
             nmr_features['c_mask']
-        )  # (B, max_atoms, hidden)
+        )
         
-        # 4. Encode atom types
-        atom_features = self.atom_encoder(atom_types)  # (B, max_atoms, hidden)
+        # Encode atom types
+        atom_features = self.atom_encoder(atom_types)
         
-        # 5. Fuse atom-level features
-        atom_representations = torch.cat([
+        # Fuse all atom-level features
+        atom_representations = self.feature_fusion(
             position_features,
             nmr_encoded,
             atom_features
-        ], dim=-1)  # (B, max_atoms, hidden*3)
+        )
         
-        atom_representations = self.feature_fusion(atom_representations)  # (B, max_atoms, hidden)
-        
-        # 6. Cross-attention between SMILES and atoms
-        # Create attention mask for atoms (inverted atom_mask for padding)
+        # Apply atom mask
+        return atom_representations * atom_mask.unsqueeze(-1)
+    
+    def _cross_attention(self,
+                        smiles_embeddings: torch.Tensor,
+                        atom_representations: torch.Tensor,
+                        attention_mask: torch.Tensor,
+                        atom_mask: torch.Tensor) -> tuple:
+        """Apply cross-attention between SMILES and atoms"""
+        # Create attention masks (inverted for padding)
         atom_attn_mask = ~atom_mask.bool()
+        smiles_attn_mask = ~attention_mask.bool()
         
         # SMILES tokens attend to atoms
         enhanced_smiles = self.smiles_to_atoms(
-            smiles_embeddings, 
-            atom_representations, 
+            smiles_embeddings,
+            atom_representations,
             atom_representations,
             atom_attn_mask
         )
@@ -307,17 +230,30 @@ class NMRChemBERTa(nn.Module):
             atom_representations,
             enhanced_smiles,
             enhanced_smiles,
-            ~attention_mask.bool()
+            smiles_attn_mask
         )
         
-        # 7. Make predictions
-        predictions = {
-            'nmr_shifts': self.nmr_predictor(enhanced_atoms),  # (B, max_atoms, 2)
-            'positions': self.position_predictor(enhanced_atoms),  # (B, max_atoms, 3)
-            'atom_types': self.atom_classifier(enhanced_atoms),  # (B, max_atoms, num_types)
-            'smiles_positions': self.smiles_position_predictor(enhanced_atoms),  # (B, max_atoms, 1)
-            'atom_representations': enhanced_atoms,  # (B, max_atoms, hidden)
-            'smiles_representations': enhanced_smiles  # (B, seq_len, hidden)
-        }
+        return enhanced_smiles, enhanced_atoms
+    
+    def unfreeze_chemberta(self):
+        """Unfreeze ChemBERTa for fine-tuning"""
+        for param in self.chemberta.parameters():
+            param.requires_grad = True
+        logger.info("ChemBERTa parameters unfrozen for fine-tuning")
+    
+    def freeze_chemberta(self):
+        """Freeze ChemBERTa parameters"""
+        for param in self.chemberta.parameters():
+            param.requires_grad = False
+        logger.info("ChemBERTa parameters frozen")
+    
+    def get_parameter_count(self):
+        """Get number of trainable and total parameters"""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
-        return predictions
+        return {
+            'total_parameters': total_params,
+            'trainable_parameters': trainable_params,
+            'frozen_parameters': total_params - trainable_params
+        }
