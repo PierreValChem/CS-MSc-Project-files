@@ -1,0 +1,53 @@
+# NMR-ChemBERTa Configuration File
+
+model:
+  chemberta_name: "seyonec/ChemBERTa-zinc-base-v1"
+  hidden_dim: 768
+  num_atom_types: 10
+  max_atoms: 200
+  max_seq_length: 512
+  dropout: 0.1
+  num_attention_heads: 8
+  freeze_chemberta: true
+
+data:
+  data_directory: "CSV_to_NMRe_output_v3/"
+  batch_size: 16
+  train_split: 0.8
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+  max_files_limit: 1000  # Set to null for no limit
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  num_epochs: 100
+  warmup_steps: 1000
+  gradient_clip_norm: 1.0
+  accumulation_steps: 1
+  save_every_n_epochs: 5
+  validate_every_n_steps: 100
+  early_stopping_patience: 10
+  
+  # Loss weights
+  nmr_loss_weight: 1.0
+  position_loss_weight: 1.0
+  atom_type_loss_weight: 1.0
+  smiles_position_loss_weight: 0.5
+
+hardware:
+  device: "auto"  # auto, cpu, cuda, mps
+  mixed_precision: true
+  compile_model: true
+  use_distributed: false
+  gradient_checkpointing: false
+  channels_last: true
+
+logging:
+  log_level: "INFO"
+  use_wandb: false
+  use_tensorboard: true
+  log_dir: "./logs"
+  checkpoint_dir: "./checkpoints"
+  experiment_name: "nmr_chemberta_experiment"
