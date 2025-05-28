@@ -49,7 +49,7 @@ class TrainingConfig:
     # Loss weights
     nmr_loss_weight: float = 1.0
     position_loss_weight: float = 1.0
-    atom_type_loss_weight: float = 0.0
+    atom_type_loss_weight: float = 1.0
     smiles_position_loss_weight: float = 0.5
 
 
