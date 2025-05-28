@@ -60,7 +60,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn,
         targets, masks = prepare_batch_targets(batch_device, device)
         
         # Forward pass with mixed precision
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             predictions = model(
                 input_ids=batch_device['input_ids'],
                 attention_mask=batch_device['attention_mask'],

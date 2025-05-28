@@ -145,7 +145,7 @@ def get_optimal_batch_size(model: nn.Module,
 def setup_mixed_precision() -> Tuple[torch.cuda.amp.GradScaler, bool]:
     """Setup mixed precision training"""
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     if use_amp:
         logger.info("Mixed precision training enabled (AMP)")

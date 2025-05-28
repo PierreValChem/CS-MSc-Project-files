@@ -221,7 +221,7 @@ class MetricsCalculator:
         if len(valid_pred) > 0:
             # MAE for both H and C shifts
             mae = torch.abs(valid_pred - valid_target)
-            self.metrics['nmr_mae'].extend(mae.cpu().numpy())
+            self.metrics['nmr_mae'].extend(mae.detach().cpu().numpy())  # Add .detach()
             
             # Separate H and C metrics
             h_mask = mask[:, :, 0].bool()
@@ -229,11 +229,11 @@ class MetricsCalculator:
             
             if h_mask.any():
                 h_mae = torch.abs(pred[:, :, 0][h_mask] - target[:, :, 0][h_mask])
-                self.metrics['h_nmr_mae'].extend(h_mae.cpu().numpy())
+                self.metrics['h_nmr_mae'].extend(h_mae.detach().cpu().numpy())  # Add .detach()
             
             if c_mask.any():
                 c_mae = torch.abs(pred[:, :, 1][c_mask] - target[:, :, 1][c_mask])
-                self.metrics['c_nmr_mae'].extend(c_mae.cpu().numpy())
+                self.metrics['c_nmr_mae'].extend(c_mae.detach().cpu().numpy())
     
     def _update_position_metrics(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
         """Update 3D position prediction metrics"""
@@ -245,7 +245,7 @@ class MetricsCalculator:
             # RMSD
             squared_diff = torch.sum((valid_pred - valid_target) ** 2, dim=1)
             rmsd = torch.sqrt(squared_diff)
-            self.metrics['position_rmsd'].extend(rmsd.cpu().numpy())
+            self.metrics['position_rmsd'].extend(rmsd.detach().cpu().numpy())
     
     def _update_atom_type_metrics(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
         """Update atom type classification metrics"""
@@ -256,7 +256,7 @@ class MetricsCalculator:
         
         if len(valid_pred) > 0:
             accuracy = (valid_pred == valid_target).float()
-            self.metrics['atom_type_accuracy'].extend(accuracy.cpu().numpy())
+            self.metrics['atom_type_accuracy'].extend(accuracy.detach().cpu().numpy())
     
     def compute_metrics(self) -> Dict:
         """Compute final metrics from accumulated values"""
