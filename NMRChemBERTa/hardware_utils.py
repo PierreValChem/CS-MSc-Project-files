@@ -260,3 +260,44 @@ class HardwareOptimizer:
             self.config.hardware.compile_model,
             self.config.hardware.channels_last
         )
+
+def setup_hardware(config):
+    """Setup hardware based on configuration"""
+    # Log hardware info first
+    log_hardware_info()
+    
+    # Setup device
+    device = setup_device(config.hardware.device)
+    
+    # Apply memory optimizations
+    optimize_memory_usage()
+    
+    return device
+
+
+def get_hardware_config():
+    """Get current hardware configuration details"""
+    config = {
+        'platform': platform.platform(),
+        'processor': platform.processor(),
+        'cpu_count': psutil.cpu_count(),
+        'cpu_count_physical': psutil.cpu_count(logical=False),
+        'ram_gb': psutil.virtual_memory().total / 1024**3,
+        'gpu_available': torch.cuda.is_available()
+    }
+    
+    if torch.cuda.is_available():
+        config['cuda_version'] = torch.version.cuda
+        config['cudnn_version'] = torch.backends.cudnn.version()
+        config['gpu_count'] = torch.cuda.device_count()
+        config['gpus'] = []
+        
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            config['gpus'].append({
+                'name': props.name,
+                'memory_gb': props.total_memory / 1024**3,
+                'compute_capability': f"{props.major}.{props.minor}"
+            })
+    
+    return config

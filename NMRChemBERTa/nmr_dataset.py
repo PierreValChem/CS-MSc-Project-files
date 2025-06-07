@@ -234,6 +234,8 @@ class NMRDataset(Dataset):
         c_shifts = np.zeros(self.max_atoms, dtype=np.float32)
         h_mask = np.zeros(self.max_atoms, dtype=np.float32)
         c_mask = np.zeros(self.max_atoms, dtype=np.float32)
+        h_normalized = (shift - self.nmr_norm_params['h_shift']['mean']) / self.nmr_norm_params['h_shift']['std']
+        c_normalized = (shift - self.nmr_norm_params['c_shift']['mean']) / self.nmr_norm_params['c_shift']['std']
 
         # Fill H NMR data
         for shift, atoms in zip(nmr_data['H']['shifts'], nmr_data['H']['atoms']):

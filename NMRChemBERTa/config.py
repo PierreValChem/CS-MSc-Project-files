@@ -12,7 +12,7 @@ import os
 class ModelConfig:
     """Model architecture configuration"""
     # Updated to latest ChemBERTa v2
-    chemberta_name: str = 'DeepChem/ChemBERTa-77M-MTR'  # Latest version
+    chemberta_name: str = 'DeepChem/ChemBERTa-77M-MLMS'  # Latest version
     # Alternative options:
     # 'seyonec/ChemBERTa-zinc250k-v2-5M' (smaller)
     # 'seyonec/ChemBERTa-zinc250k-v2-77M' (medium)
@@ -61,6 +61,8 @@ class TrainingConfig:
     save_every_n_epochs: int = 5
     validate_every_n_steps: int = 100
     early_stopping_patience: int = 10
+    scheduler_patience: int = 5
+    use_amp: bool = True
     
     # Enhanced loss weights for better NMR connection
     nmr_loss_weight: float = 2.0  # Increased from 1.0

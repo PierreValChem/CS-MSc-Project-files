@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import time
@@ -18,10 +18,10 @@ import seaborn as sns
 from datetime import datetime
 import pandas as pd
 
-from config import Config
+from config import Config, get_default_config
 from nmr_dataset import create_data_loaders
 from nmr_chemberta_model import NMRChemBERTa
-from training_utils import MultiTaskLoss, compute_metrics
+from training_utils import MultiTaskLoss, compute_metrics, prepare_batch_targets
 from hardware_utils import setup_hardware, get_hardware_config
 
 # Set up logging
@@ -391,26 +391,33 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
     
     for batch_idx, batch in enumerate(progress_bar):
-        # Move batch to device
-        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        # Move batch to device - handle nested dictionaries
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch[key] = value.to(device)
+            elif isinstance(value, dict):
+                batch[key] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                             for k, v in value.items()}
         
         optimizer.zero_grad()
         
         # Forward pass with or without AMP
         if use_amp and scaler is not None:
-            with autocast():
+            with autocast(device_type='cuda'):
                 predictions = model(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
+                    coords=batch['coords'],
                     atom_types=batch['atom_types'],
-                    h_shifts=batch['h_shifts'],
-                    c_shifts=batch['c_shifts'],
-                    positions=batch['positions'],
-                    h_mask=batch['h_mask'],
-                    c_mask=batch['c_mask'],
-                    position_mask=batch['position_mask']
+                    atom_mask=batch['atom_mask'],
+                    nmr_features=batch['nmr_features']
                 )
-                loss, loss_components = loss_fn(predictions, batch)
+                
+                # Prepare targets and masks
+                targets, masks = prepare_batch_targets(batch, device)
+                loss_dict = loss_fn(predictions, targets, masks)
+                loss = loss_dict['total_loss']
+                loss_components = loss_dict
             
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
@@ -426,15 +433,15 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
             predictions = model(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
+                coords=batch['coords'],
                 atom_types=batch['atom_types'],
-                h_shifts=batch['h_shifts'],
-                c_shifts=batch['c_shifts'],
-                positions=batch['positions'],
-                h_mask=batch['h_mask'],
-                c_mask=batch['c_mask'],
-                position_mask=batch['position_mask']
+                atom_mask=batch['atom_mask'],
+                nmr_features=batch['nmr_features']
             )
-            loss, loss_components = loss_fn(predictions, batch)
+            
+            # Prepare targets and masks
+            targets, masks = prepare_batch_targets(batch, device)
+            loss, loss_components = loss_fn(predictions, targets, masks)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -442,16 +449,17 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
         
         total_loss += loss.item()
         
-        # Store predictions and targets
+        # Store predictions and targets for metrics computation
         all_predictions.append({k: v.detach().cpu() for k, v in predictions.items()})
         all_targets.append({
-            'h_shifts': batch['h_shifts'].detach().cpu(),
-            'c_shifts': batch['c_shifts'].detach().cpu(),
-            'positions': batch['positions'].detach().cpu(),
+            'h_shifts': batch['nmr_features']['h_shifts'].detach().cpu(),
+            'c_shifts': batch['nmr_features']['c_shifts'].detach().cpu(),
+            'positions': batch['coords'].detach().cpu(),
             'atom_types': batch['atom_types'].detach().cpu(),
-            'h_mask': batch['h_mask'].detach().cpu(),
-            'c_mask': batch['c_mask'].detach().cpu(),
-            'position_mask': batch['position_mask'].detach().cpu()
+            'h_mask': batch['nmr_features']['h_mask'].detach().cpu(),
+            'c_mask': batch['nmr_features']['c_mask'].detach().cpu(),
+            'position_mask': batch['atom_mask'].detach().cpu(),
+            'atom_mask': batch['atom_mask'].detach().cpu()
         })
         
         # Update progress bar
@@ -475,48 +483,53 @@ def validate_epoch(model, dataloader, loss_fn, device, use_amp=False):
     
     with torch.no_grad():
         for batch in progress_bar:
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            # Move batch to device - handle nested dictionaries
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(device)
+                elif isinstance(value, dict):
+                    batch[key] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                                 for k, v in value.items()}
             
             if use_amp:
-                with autocast():
+                with autocast(device_type='cuda'):
                     predictions = model(
                         input_ids=batch['input_ids'],
                         attention_mask=batch['attention_mask'],
+                        coords=batch['coords'],
                         atom_types=batch['atom_types'],
-                        h_shifts=batch['h_shifts'],
-                        c_shifts=batch['c_shifts'],
-                        positions=batch['positions'],
-                        h_mask=batch['h_mask'],
-                        c_mask=batch['c_mask'],
-                        position_mask=batch['position_mask']
+                        atom_mask=batch['atom_mask'],
+                        nmr_features=batch['nmr_features']
                     )
-                    loss, _ = loss_fn(predictions, batch)
+                    targets, masks = prepare_batch_targets(batch, device)
+                    loss_dict = loss_fn(predictions, targets, masks)
+                    loss = loss_dict['total_loss']
+                    loss_components = loss_dict
             else:
                 predictions = model(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
+                    coords=batch['coords'],
                     atom_types=batch['atom_types'],
-                    h_shifts=batch['h_shifts'],
-                    c_shifts=batch['c_shifts'],
-                    positions=batch['positions'],
-                    h_mask=batch['h_mask'],
-                    c_mask=batch['c_mask'],
-                    position_mask=batch['position_mask']
+                    atom_mask=batch['atom_mask'],
+                    nmr_features=batch['nmr_features']
                 )
-                loss, _ = loss_fn(predictions, batch)
+                targets, masks = prepare_batch_targets(batch, device)
+                loss, _ = loss_fn(predictions, targets, masks)
             
             total_loss += loss.item()
             
-            # Store predictions and targets
+            # Store predictions and targets for metrics computation
             all_predictions.append({k: v.cpu() for k, v in predictions.items()})
             all_targets.append({
-                'h_shifts': batch['h_shifts'].cpu(),
-                'c_shifts': batch['c_shifts'].cpu(),
-                'positions': batch['positions'].cpu(),
+                'h_shifts': batch['nmr_features']['h_shifts'].cpu(),
+                'c_shifts': batch['nmr_features']['c_shifts'].cpu(),
+                'positions': batch['coords'].cpu(),
                 'atom_types': batch['atom_types'].cpu(),
-                'h_mask': batch['h_mask'].cpu(),
-                'c_mask': batch['c_mask'].cpu(),
-                'position_mask': batch['position_mask'].cpu()
+                'h_mask': batch['nmr_features']['h_mask'].cpu(),
+                'c_mask': batch['nmr_features']['c_mask'].cpu(),
+                'position_mask': batch['atom_mask'].cpu(),
+                'atom_mask': batch['atom_mask'].cpu()
             })
             
             progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
@@ -531,7 +544,7 @@ def validate_epoch(model, dataloader, loss_fn, device, use_amp=False):
 def main():
     """Main training function with enhanced reporting"""
     # Load configuration
-    config = Config()
+    config = Config.from_yaml('config.yaml')
     
     # Setup hardware
     device = setup_hardware(config)
@@ -574,12 +587,11 @@ def main():
         mode='min',
         factor=0.5,
         patience=config.training.scheduler_patience,
-        min_lr=1e-8,
-        verbose=True
+        min_lr=1e-8
     )
     
     # Initialize gradient scaler for mixed precision
-    scaler = GradScaler() if config.training.use_amp and device.type == 'cuda' else None
+    scaler = GradScaler('cuda') if config.training.use_amp and device.type == 'cuda' else None
     use_amp = config.training.use_amp and device.type == 'cuda'
     
     # Initialize comprehensive trainer
