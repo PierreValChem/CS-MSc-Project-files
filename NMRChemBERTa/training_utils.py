@@ -35,6 +35,17 @@ class MultiTaskLoss(nn.Module):
         self.position_weight = config.training.position_loss_weight
         self.atom_type_weight = config.training.atom_type_loss_weight
         self.smiles_pos_weight = config.training.smiles_position_loss_weight
+
+        # Enhanced NMR loss
+        if hasattr(config.training, 'nmr_loss_type'):
+            if config.training.nmr_loss_type == 'huber':
+                self.nmr_base_loss = nn.HuberLoss(reduction='none', delta=1.0)
+            elif config.training.nmr_loss_type == 'mae':
+                self.nmr_base_loss = nn.L1Loss(reduction='none')
+            else:
+                self.nmr_base_loss = nn.MSELoss(reduction='none')
+        else:
+            self.nmr_base_loss = nn.MSELoss(reduction='none')
     
     def forward(self, predictions: Dict, targets: Dict, masks: Dict) -> Dict:
         """
@@ -95,16 +106,17 @@ class MultiTaskLoss(nn.Module):
         return losses
     
     def _compute_nmr_loss(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Compute NMR chemical shift prediction loss"""
-        # pred: (batch_size, max_atoms, 2) - H and C shifts
-        # target: (batch_size, max_atoms, 2)
-        # mask: (batch_size, max_atoms, 2) - separate masks for H and C
+        """Compute NMR chemical shift prediction loss with enhanced weighting"""
+        loss = self.nmr_base_loss(pred, target)
         
-        loss = self.mse_loss(pred, target)  # (batch_size, max_atoms, 2)
+        # Enhanced weighting
+        if hasattr(self.config.training, 'nmr_loss_reduction') and self.config.training.nmr_loss_reduction == 'weighted':
+            weights = 1.0 + torch.abs(target) / 100.0
+            loss = loss * weights
+        
         masked_loss = loss * mask
-        
-        # Average over valid predictions
         num_valid = mask.sum()
+        
         if num_valid > 0:
             return masked_loss.sum() / num_valid
         else:
