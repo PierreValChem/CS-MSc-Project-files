@@ -49,6 +49,9 @@ class NMRChemBERTa(nn.Module):
         
         # Initialize task heads
         self._setup_task_heads()
+
+        # Initialize weights
+        self._init_weights()
         
         # Apply gradient checkpointing if requested
         if config.hardware.gradient_checkpointing:
@@ -135,6 +138,13 @@ class NMRChemBERTa(nn.Module):
         apply_gradient_checkpointing(self, layers_to_checkpoint)
         logger.info("Gradient checkpointing applied")
     
+    def _init_weights(self):
+        """Initialize weights with small values"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
     def forward(self, 
                 input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,

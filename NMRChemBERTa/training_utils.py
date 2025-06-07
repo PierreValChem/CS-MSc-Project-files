@@ -14,6 +14,7 @@ import time
 from collections import defaultdict
 import wandb
 from pathlib import Path
+from typing import List
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,39 @@ class MetricsCalculator:
         
         return computed_metrics
 
+def compute_metrics(predictions: List[Dict], targets: List[Dict]) -> Dict:
+    """
+    Compute metrics from batched predictions and targets
+    
+    Args:
+        predictions: List of prediction dictionaries from each batch
+        targets: List of target dictionaries from each batch
+        
+    Returns:
+        Dictionary of computed metrics
+    """
+    calculator = MetricsCalculator()
+    
+    # Process each batch
+    for pred_batch, target_batch in zip(predictions, targets):
+        # Prepare masks from targets
+        masks = {
+            'atom_mask': target_batch['atom_mask'] if 'atom_mask' in target_batch else target_batch['position_mask'],
+            'nmr_mask': torch.stack([target_batch['h_mask'], target_batch['c_mask']], dim=-1)
+        }
+        
+        # Prepare targets in expected format
+        formatted_targets = {
+            'nmr_shifts': torch.stack([target_batch['h_shifts'], target_batch['c_shifts']], dim=-1),
+            'positions': target_batch['positions'],
+            'atom_types': target_batch['atom_types']
+        }
+        
+        # Update metrics
+        calculator.update(pred_batch, formatted_targets, masks)
+    
+    # Compute final metrics
+    return calculator.compute_metrics()
 
 class EarlyStopping:
     """Early stopping utility"""
