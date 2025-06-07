@@ -42,6 +42,12 @@ class NMRDataset(Dataset):
         
         # Load data
         self.data = self._load_data()
+
+        #normalize data
+        self.nmr_norm_params = {
+    'h_shift': {'mean': 7.5, 'std': 2.5},    # Typical H NMR: 0-15 ppm
+    'c_shift': {'mean': 100.0, 'std': 50.0}  # Typical C NMR: 0-200 ppm
+        }
         
         logger.info(f"{split.upper()} dataset: {len(self.data)} samples")
         
@@ -228,21 +234,23 @@ class NMRDataset(Dataset):
         c_shifts = np.zeros(self.max_atoms, dtype=np.float32)
         h_mask = np.zeros(self.max_atoms, dtype=np.float32)
         c_mask = np.zeros(self.max_atoms, dtype=np.float32)
-        
+
         # Fill H NMR data
         for shift, atoms in zip(nmr_data['H']['shifts'], nmr_data['H']['atoms']):
+            h_normalized = (shift - self.nmr_norm_params['h_shift']['mean']) / self.nmr_norm_params['h_shift']['std']
             for atom_idx in atoms:
                 if 0 <= atom_idx < min(self.max_atoms, num_atoms):
-                    h_shifts[atom_idx] = shift
+                    h_shifts[atom_idx] = h_normalized
                     h_mask[atom_idx] = 1.0
-        
+
         # Fill C NMR data
         for shift, atoms in zip(nmr_data['C']['shifts'], nmr_data['C']['atoms']):
+            c_normalized = (shift - self.nmr_norm_params['c_shift']['mean']) / self.nmr_norm_params['c_shift']['std']
             for atom_idx in atoms:
                 if 0 <= atom_idx < min(self.max_atoms, num_atoms):
-                    c_shifts[atom_idx] = shift
+                    c_shifts[atom_idx] = c_normalized
                     c_mask[atom_idx] = 1.0
-        
+
         return {
             'h_shifts': torch.tensor(h_shifts, dtype=torch.float32),
             'c_shifts': torch.tensor(c_shifts, dtype=torch.float32),
@@ -278,7 +286,7 @@ def create_data_loaders(config) -> tuple:
     test_size = total_size - train_size - val_size
     
     # Ensure minimum sizes
-    if train_size < 1 or val_size < 1:
+    if train_size < 1 or val_size < 1 or test_size < 1:
         raise ValueError(f"Dataset too small for splits: {total_size} total samples")
     
     # Random split
@@ -326,10 +334,11 @@ def create_data_loaders(config) -> tuple:
         num_workers=num_workers,
         pin_memory=config.data.pin_memory,
         persistent_workers=num_workers > 0
-    ) if test_size > 0 else None
+    )
     
-    logger.info(f"Data splits - Train: {len(train_dataset)}, "
-                f"Val: {len(val_dataset)}, Test: {len(test_dataset) if test_dataset else 0}")
+    logger.info(f"Data splits - Train: {len(train_dataset)} ({len(train_dataset)/total_size:.1%}), "
+            f"Val: {len(val_dataset)} ({len(val_dataset)/total_size:.1%}), "
+            f"Test: {len(test_dataset)} ({len(test_dataset)/total_size:.1%})")
     
     return train_loader, val_loader, test_loader, full_dataset
 

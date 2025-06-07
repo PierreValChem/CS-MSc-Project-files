@@ -290,3 +290,118 @@ def apply_gradient_checkpointing(model: nn.Module, layers_to_checkpoint: list):
             setattr(model, layer_name, GradientCheckpointWrapper(layer))
     
     return model
+
+class EnhancedNMREncoder(nn.Module):
+    """Enhanced encoder for NMR spectroscopic data with better feature integration"""
+    
+    def __init__(self, hidden_dim: int, nmr_hidden_dim: int = 256, 
+                 num_layers: int = 3, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.nmr_hidden_dim = nmr_hidden_dim
+        
+        # Multi-scale NMR encoding
+        self.h_shift_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, nmr_hidden_dim // 4),
+                nn.LayerNorm(nmr_hidden_dim // 4),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(3)
+        ])
+        
+        self.c_shift_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, nmr_hidden_dim // 4),
+                nn.LayerNorm(nmr_hidden_dim // 4),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(3)
+        ])
+        
+        # Attention mechanism
+        self.nmr_self_attention = nn.MultiheadAttention(
+            nmr_hidden_dim, 
+            num_heads=4, 
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Deep processor
+        self.nmr_processor = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=nmr_hidden_dim,
+                nhead=4,
+                dim_feedforward=nmr_hidden_dim * 4,
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+        
+        # Project to hidden dim
+        self.nmr_to_hidden = nn.Sequential(
+            nn.Linear(nmr_hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.residual_weight = nn.Parameter(torch.tensor(0.1))
+        
+    def forward(self, h_shifts: torch.Tensor, c_shifts: torch.Tensor,
+                h_mask: torch.Tensor, c_mask: torch.Tensor,
+                atom_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Modified to return just nmr_features for compatibility"""
+        batch_size, max_atoms = h_shifts.shape
+        
+        # Multi-scale encoding
+        h_features_multi = []
+        c_features_multi = []
+        
+        for i, (h_encoder, c_encoder) in enumerate(zip(self.h_shift_encoders, self.c_shift_encoders)):
+            scale_factor = 2 ** i
+            h_scaled = h_shifts.unsqueeze(-1) / scale_factor
+            c_scaled = c_shifts.unsqueeze(-1) / scale_factor
+            
+            h_features_multi.append(h_encoder(h_scaled))
+            c_features_multi.append(c_encoder(c_scaled))
+        
+        h_features = torch.cat(h_features_multi, dim=-1)
+        c_features = torch.cat(c_features_multi, dim=-1)
+        
+        h_features = h_features * h_mask.unsqueeze(-1)
+        c_features = c_features * c_mask.unsqueeze(-1)
+        
+        nmr_features = torch.cat([h_features, c_features], dim=-1)
+        
+        # Truncate or pad
+        if nmr_features.shape[-1] > self.nmr_hidden_dim:
+            nmr_features = nmr_features[..., :self.nmr_hidden_dim]
+        elif nmr_features.shape[-1] < self.nmr_hidden_dim:
+            padding = torch.zeros(
+                batch_size, max_atoms, 
+                self.nmr_hidden_dim - nmr_features.shape[-1],
+                device=nmr_features.device
+            )
+            nmr_features = torch.cat([nmr_features, padding], dim=-1)
+        
+        # Self-attention
+        combined_mask = (h_mask + c_mask) > 0
+        nmr_features_attn, attention_weights = self.nmr_self_attention(
+            nmr_features, nmr_features, nmr_features,
+            key_padding_mask=~combined_mask
+        )
+        
+        nmr_features = nmr_features + self.residual_weight * nmr_features_attn
+        
+        # Process through transformer layers
+        for layer in self.nmr_processor:
+            nmr_features = layer(nmr_features, src_key_padding_mask=~combined_mask)
+        
+        # Project to hidden dimension
+        nmr_features_out = self.nmr_to_hidden(nmr_features)
+        nmr_features_out = nmr_features_out * combined_mask.unsqueeze(-1)
+        
+        # Return just nmr_features for compatibility with existing code
+        return nmr_features_out

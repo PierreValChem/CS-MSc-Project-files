@@ -16,7 +16,8 @@ from model_components import (
     CrossAttentionLayer,
     TaskHeads,
     FeatureFusion,
-    apply_gradient_checkpointing
+    apply_gradient_checkpointing,
+    EnhancedNMREncoder
 )
 
 logger = logging.getLogger(__name__)
@@ -73,11 +74,21 @@ class NMRChemBERTa(nn.Module):
             self.max_atoms
         )
         
-        self.nmr_encoder = NMREncoder(
-            self.hidden_dim,
-            self.config.model.dropout
-        )
+        # Use enhanced NMR encoder if configured
+        if hasattr(self.config.model, 'nmr_hidden_dim'):
+            self.nmr_encoder = EnhancedNMREncoder(
+                self.hidden_dim,
+                self.config.model.nmr_hidden_dim,
+                self.config.model.nmr_num_layers,
+                self.config.model.dropout
+            )
+        else:
+            self.nmr_encoder = NMREncoder(
+                self.hidden_dim,
+                self.config.model.dropout
+            )
         
+        # Make sure atom_encoder is created!
         self.atom_encoder = AtomFeatureEncoder(
             self.config.model.num_atom_types,
             self.hidden_dim,

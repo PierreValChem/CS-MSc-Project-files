@@ -11,14 +11,24 @@ import os
 @dataclass
 class ModelConfig:
     """Model architecture configuration"""
-    chemberta_name: str = 'seyonec/ChemBERTa-zinc-base-v1'
-    hidden_dim: int = 768
+    # Updated to latest ChemBERTa v2
+    chemberta_name: str = 'DeepChem/ChemBERTa-77M-MTR'  # Latest version
+    # Alternative options:
+    # 'seyonec/ChemBERTa-zinc250k-v2-5M' (smaller)
+    # 'seyonec/ChemBERTa-zinc250k-v2-77M' (medium)
+    # 'seyonec/ChemBERTa-zinc250k-v2-177M' (larger)
+    
+    hidden_dim: int = 384
     num_atom_types: int = 10
     max_atoms: int = 200
     max_seq_length: int = 512
     dropout: float = 0.1
-    num_attention_heads: int = 8
+    num_attention_heads: int = 6
     freeze_chemberta: bool = True
+    
+    # Enhanced NMR encoding
+    nmr_hidden_dim: int = 256  # Dedicated hidden dim for NMR features
+    nmr_num_layers: int = 3  # More layers for NMR processing
 
 
 @dataclass
@@ -26,11 +36,17 @@ class DataConfig:
     """Data processing configuration"""
     data_directory: str = "CSV_to_NMRe_output_v3/"
     batch_size: int = 16
-    train_split: float = 0.8
-    val_split: float = 0.1
+    train_split: float = 0.7  # Changed from 0.8
+    val_split: float = 0.2    # Changed from 0.1
+    test_split: float = 0.1   # Added test split
     num_workers: int = 4
     pin_memory: bool = True
     max_files_limit: Optional[int] = 1000  # Limit for testing
+    
+    # Cross-validation settings
+    use_cross_validation: bool = False
+    num_folds: int = 5
+    current_fold: int = 0
 
 
 @dataclass
@@ -46,11 +62,16 @@ class TrainingConfig:
     validate_every_n_steps: int = 100
     early_stopping_patience: int = 10
     
-    # Loss weights
-    nmr_loss_weight: float = 1.0
+    # Enhanced loss weights for better NMR connection
+    nmr_loss_weight: float = 2.0  # Increased from 1.0
     position_loss_weight: float = 1.0
     atom_type_loss_weight: float = 1.0
     smiles_position_loss_weight: float = 0.5
+    
+    # Additional loss settings
+    nmr_loss_type: str = 'huber'  # 'mse', 'mae', 'huber'
+    nmr_loss_reduction: str = 'weighted'  # 'mean', 'weighted'
+    use_nmr_attention_loss: bool = True  # Additional attention-based loss
 
 
 @dataclass
@@ -73,6 +94,11 @@ class LoggingConfig:
     log_dir: str = './logs'
     checkpoint_dir: str = './checkpoints'
     experiment_name: str = 'nmr_chemberta'
+    
+    # Visualization settings
+    plot_every_n_epochs: int = 5
+    save_plots: bool = True
+    plot_dir: str = './plots'
 
 
 @dataclass
