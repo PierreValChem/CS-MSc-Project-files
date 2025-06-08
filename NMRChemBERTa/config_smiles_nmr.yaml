@@ -1,0 +1,64 @@
+# config_smiles_nmr.yaml - Focused on SMILES-NMR correlation
+
+model:
+  chemberta_name: "DeepChem/ChemBERTa-77M-MLM"
+  hidden_dim: 384
+  num_atom_types: 10
+  max_atoms: 200
+  max_seq_length: 512
+  dropout: 0.1
+  num_attention_heads: 6
+  freeze_chemberta: false  # Unfreeze to fine-tune for NMR
+  nmr_hidden_dim: 256
+  nmr_num_layers: 3
+
+data:
+  data_directory: "CSV_to_NMRe_output_v3/"
+  batch_size: 32
+  train_split: 0.8
+  val_split: 0.15
+  test_split: 0.05
+  num_workers: 4
+  pin_memory: true
+  max_files_limit: null  # Use ALL data
+
+training:
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-5
+  num_epochs: 200
+  warmup_steps: 1000
+  gradient_clip_norm: 1.0
+  accumulation_steps: 1
+  save_every_n_epochs: 5
+  validate_every_n_steps: 100
+  early_stopping_patience: 15
+  scheduler_patience: 5
+  use_amp: false
+  
+  # Focus ONLY on NMR prediction
+  nmr_loss_weight: 1.0
+  nmr_loss_type: "huber"
+  nmr_loss_reduction: "weighted"
+  use_nmr_attention_loss: true
+  
+  # Disable all other tasks
+  position_loss_weight: 0.0
+  atom_type_loss_weight: 0.0
+  smiles_position_loss_weight: 0.0
+
+hardware:
+  device: "auto"
+  mixed_precision: true
+  compile_model: false
+  use_distributed: false
+  gradient_checkpointing: false
+  channels_last: true
+
+logging:
+  log_level: "INFO"
+  use_wandb: false
+  use_tensorboard: true
+  log_dir: "./logs_smiles_nmr"
+  checkpoint_dir: "./checkpoints_smiles_nmr"
+  experiment_name: "smiles_nmr_correlation"
+  plot_every_n_epochs: 5

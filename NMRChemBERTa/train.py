@@ -441,7 +441,9 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, use_
             
             # Prepare targets and masks
             targets, masks = prepare_batch_targets(batch, device)
-            loss, loss_components = loss_fn(predictions, targets, masks)
+            loss_dict = loss_fn(predictions, targets, masks)
+            loss = loss_dict['total_loss']
+            loss_components = loss_dict
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -515,7 +517,8 @@ def validate_epoch(model, dataloader, loss_fn, device, use_amp=False):
                     nmr_features=batch['nmr_features']
                 )
                 targets, masks = prepare_batch_targets(batch, device)
-                loss, _ = loss_fn(predictions, targets, masks)
+                loss_dict = loss_fn(predictions, targets, masks)
+                loss = loss_dict['total_loss']
             
             total_loss += loss.item()
             
@@ -632,11 +635,25 @@ def main():
                               current_lr, epoch_time)
         
         # Log epoch results
-        logger.info(f"Epoch {epoch:3d} | "
-                   f"Train Loss: {train_metrics['total_loss']:.6f} | "
-                   f"Val Loss: {val_metrics['total_loss']:.6f} | "
-                   f"LR: {current_lr:.2e} | "
-                   f"Time: {epoch_time:.1f}s")
+        train_loss = train_metrics.get('total_loss', float('nan'))
+        val_loss = val_metrics.get('total_loss', float('nan'))
+
+        # Check if losses are valid numbers
+        if np.isnan(train_loss) or np.isnan(val_loss):
+            logger.warning(f"Epoch {epoch:3d} | NaN detected - Train: {train_loss}, Val: {val_loss}")
+            # Log individual components to debug
+            logger.info("Train metrics:")
+            for k, v in train_metrics.items():
+                logger.info(f"  {k}: {v}")
+            logger.info("Val metrics:")
+            for k, v in val_metrics.items():
+                logger.info(f"  {k}: {v}")
+        else:
+            logger.info(f"Epoch {epoch:3d} | "
+                    f"Train Loss: {train_loss:.6f} | "
+                    f"Val Loss: {val_loss:.6f} | "
+                    f"LR: {current_lr:.2e} | "
+                    f"Time: {epoch_time:.1f}s")
         
         # Additional detailed logging every 10 epochs
         if epoch % 10 == 0:

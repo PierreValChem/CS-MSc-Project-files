@@ -12,7 +12,7 @@ import os
 class ModelConfig:
     """Model architecture configuration"""
     # Updated to latest ChemBERTa v2
-    chemberta_name: str = 'DeepChem/ChemBERTa-77M-MLMS'  # Latest version
+    chemberta_name: str = 'DeepChem/ChemBERTa-77M-MLM'  # Latest version
     # Alternative options:
     # 'seyonec/ChemBERTa-zinc250k-v2-5M' (smaller)
     # 'seyonec/ChemBERTa-zinc250k-v2-77M' (medium)

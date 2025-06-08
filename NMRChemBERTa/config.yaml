@@ -23,7 +23,7 @@ data:
   max_files_limit: null  # Set to null for no limit
 
 training:
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   num_epochs: 1000
   warmup_steps: 1000
@@ -36,13 +36,13 @@ training:
   use_amp: false 
   
   # Loss weights
-  nmr_loss_weight: 2.0  # CHANGE from 1.0
+  nmr_loss_weight: 10.0  # CHANGE from 1.0
   nmr_loss_type: "huber"  # ADD THIS
   nmr_loss_reduction: "weighted"  # ADD THIS
   use_nmr_attention_loss: true  # ADD THIS
-  position_loss_weight: 1.0
+  position_loss_weight: 0.1
   atom_type_loss_weight: 1.0
-  smiles_position_loss_weight: 0.5
+  smiles_position_loss_weight: 0.1
 
 hardware:
   device: "auto"  # auto, cpu, cuda, mps

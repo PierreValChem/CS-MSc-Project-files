@@ -217,6 +217,12 @@ class TaskHeads(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 3)  # Predict x, y, z coordinates
         )
+
+        for module in self.position_predictor.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
         
         # Atom type classifier
         self.atom_classifier = nn.Sequential(
