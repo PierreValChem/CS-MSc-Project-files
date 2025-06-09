@@ -45,8 +45,8 @@ class NMRDataset(Dataset):
 
         #normalize data
         self.nmr_norm_params = {
-    'h_shift': {'mean': 7.5, 'std': 2.5},    # Typical H NMR: 0-15 ppm
-    'c_shift': {'mean': 100.0, 'std': 50.0}  # Typical C NMR: 0-200 ppm
+    'h_shift': {'mean': 3.51, 'std': 2.07},    # Typical H NMR: 0-15 ppm
+    'c_shift': {'mean': 79.81, 'std': 50.26}  # Typical C NMR: 0-200 ppm
         }
         
         logger.info(f"{split.upper()} dataset: {len(self.data)} samples")
