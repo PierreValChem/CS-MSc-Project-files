@@ -2,15 +2,15 @@
 
 model:
   chemberta_name: "DeepChem/ChemBERTa-77M-MLM"
-  hidden_dim: 512  # Increased from 384
+  hidden_dim: 768  # Increased from 384
   num_atom_types: 10
   max_atoms: 200
   max_seq_length: 512
-  dropout: 0.2  # Increased for regularization
-  num_attention_heads: 8  # Increased from 6
+  dropout: 0.1  # Increased for regularization
+  num_attention_heads: 12  # Increased from 6
   freeze_chemberta: false  # Allow fine-tuning
-  nmr_hidden_dim: 384  # Increased from 256
-  nmr_num_layers: 4  # Increased from 3
+  nmr_hidden_dim: 512  # Increased from 256
+  nmr_num_layers: 6  # Increased from 3
 
 data:
   data_directory: "CSV_to_NMRe_output_v3/"
@@ -23,16 +23,16 @@ data:
   max_files_limit: null  # Use ALL data
 
 training:
-  learning_rate: 2.0e-5  # Lower initial learning rate
-  weight_decay: 1.0e-4  # Increased regularization
+  learning_rate: 1.0e-5  # Lower initial learning rate
+  weight_decay: 1.0e-5  # Increased regularization
   num_epochs: 300  # Allow more epochs (early stopping will prevent overfitting)
-  warmup_steps: 2000  # Longer warmup
+  warmup_steps: 3000  # Longer warmup
   gradient_clip_norm: 0.5  # More aggressive clipping
-  accumulation_steps: 4  # Effective batch size = 16 * 4 = 64
+  accumulation_steps: 8  # Effective batch size = 16 * 4 = 64
   save_every_n_epochs: 10
   validate_every_n_steps: 100
-  early_stopping_patience: 20  # More patience
-  scheduler_patience: 7  # More patience before reducing LR
+  early_stopping_patience: 30  # More patience
+  scheduler_patience: 10  # More patience before reducing LR
   use_amp: true  # Enable mixed precision if GPU supports it
   
   # NMR loss configuration
@@ -47,12 +47,12 @@ training:
   smiles_position_loss_weight: 0.0
 
 hardware:
-  device: "auto"
+  device: "cuda"
   mixed_precision: true
   compile_model: false
   use_distributed: false
-  gradient_checkpointing: false
-  channels_last: true
+  gradient_checkpointing: true
+  channels_last: false
 
 logging:
   log_level: "INFO"

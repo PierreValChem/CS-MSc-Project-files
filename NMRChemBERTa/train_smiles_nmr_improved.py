@@ -564,6 +564,13 @@ def main():
     config = Config.from_yaml('config_smiles_nmr.yaml')
     
     # Setup device
+    if torch.cuda.is_available():
+        logger.info(f"GPU Available: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        # Monitor GPU usage during training
+        logger.info(f"Current GPU memory used: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    else:
+        logger.info("WARNING: CUDA not available, using CPU!")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
@@ -591,12 +598,20 @@ def main():
     loss_fn = AdaptiveLoss(config)
     
     # Create optimizer with different learning rates
+    chemberta_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if 'chemberta' in name:
+                chemberta_params.append(param)
+            else:
+                other_params.append(param)
+
     optimizer_params = [
-        {'params': model.chemberta.parameters(), 'lr': config.training.learning_rate * 0.1},
-        {'params': model.projection.parameters(), 'lr': config.training.learning_rate},
-        {'params': model.attention_pool.parameters(), 'lr': config.training.learning_rate},
-        {'params': model.nmr_predictor.parameters(), 'lr': config.training.learning_rate},
-    ]
+        {'params': chemberta_params, 'lr': config.training.learning_rate * 0.1},
+        {'params': other_params, 'lr': config.training.learning_rate}
+]
     
     optimizer = AdamW(optimizer_params, weight_decay=config.training.weight_decay)
     
@@ -606,8 +621,7 @@ def main():
         mode='min',
         factor=0.5,
         patience=config.training.scheduler_patience,
-        min_lr=1e-7,
-        verbose=True
+        min_lr=1e-7
     )
     
     # Initialize early stopping
