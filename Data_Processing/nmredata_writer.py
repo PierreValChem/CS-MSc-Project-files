@@ -1,35 +1,33 @@
+#!/usr/bin/env python3
 """
-NMReDATA file writer module
+NMReDATA file writer with support for canonical SMILES and padded peaks
 """
 
 from datetime import datetime
 import logging
+from rdkit import Chem
+from rdkit.Chem import Descriptors, rdMolDescriptors
 
-# Import with fallback
-try:
-    from Data_Processing.utils import setup_logging
-    logger = setup_logging()
-except ImportError:
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class NMReDataWriter:
-    """Handles creation of NMReDATA format files"""
+    """Handles creation of NMReDATA format files with enhanced molecular representations"""
     
     def __init__(self):
-        # Import MoleculeProcessor here to avoid circular imports
-        from Data_Processing.molecule_processor import MoleculeProcessor
+        from molecule_processor import MoleculeProcessor
         self.molecule_processor = MoleculeProcessor()
     
-    def create_nmredata_file(self, row, h_peaks_consolidated, c_peaks_consolidated, mol_3d):
-        """Create complete NMReDATA file content"""
+    def create_enhanced_nmredata_file(self, row, h_peaks, c_peaks, mol_3d):
+        """
+        Create enhanced NMReDATA with all molecular representations
+        Now handles padded peaks (with None shifts) properly
+        """
+        # Create MOL block
         mol_block = self.molecule_processor.create_mol_block(mol_3d)
-        
-        # Check if MOL block is empty or invalid
         if not mol_block or len(mol_block.strip()) < 10:
             logger.warning(f"Empty or invalid MOL block for {row['NP_MRD_ID']}")
-            return None  # Return None to indicate failure
+            return None
         
         # Build NMReDATA content
         nmredata_content = f"{mol_block}\n"
@@ -43,136 +41,121 @@ class NMReDataWriter:
 
 """
         
-        # Add 1H NMR data
-        if h_peaks_consolidated:
+        # Add 1H NMR data (including padded peaks)
+        if h_peaks:
             nmredata_content += f">  <NMREDATA_1D_1H>\n"
-            for peak in h_peaks_consolidated:
+            # Sort real peaks by atom number, padded peaks at the end
+            real_h_peaks = [p for p in h_peaks if p['atom_number'] != -1]
+            padded_h_peaks = [p for p in h_peaks if p['atom_number'] == -1]
+            
+            # Add real peaks first (sorted by atom number)
+            for peak in sorted(real_h_peaks, key=lambda x: x['atom_number']):
                 line = self._format_peak_line(peak)
                 nmredata_content += f"{line}\n"
+            
+            # Add padded peaks at the end
+            for peak in padded_h_peaks:
+                line = self._format_peak_line(peak)
+                nmredata_content += f"{line}\n"
+            
             nmredata_content += "\n"
         
-        # Add 13C NMR data
-        if c_peaks_consolidated:
+        # Add 13C NMR data (including padded peaks)
+        if c_peaks:
             nmredata_content += f">  <NMREDATA_1D_13C>\n"
-            for peak in c_peaks_consolidated:
+            # Sort real peaks by atom number, padded peaks at the end
+            real_c_peaks = [p for p in c_peaks if p['atom_number'] != -1]
+            padded_c_peaks = [p for p in c_peaks if p['atom_number'] == -1]
+            
+            # Add real peaks first (sorted by atom number)
+            for peak in sorted(real_c_peaks, key=lambda x: x['atom_number']):
                 line = self._format_peak_line(peak)
                 nmredata_content += f"{line}\n"
+            
+            # Add padded peaks at the end
+            for peak in padded_c_peaks:
+                line = self._format_peak_line(peak)
+                nmredata_content += f"{line}\n"
+            
             nmredata_content += "\n"
         
-        # Add metadata
-        nmredata_content += self._create_metadata(row)
+        # Add all molecular representations
         
-        return nmredata_content
-    
-    def _format_peak_line(self, peak):
-        """Format a single peak line for NMReDATA with enhanced consolidation support"""
-        # Start with chemical shift
-        line = f"{peak['shift']}"
+        # Original SMILES (from CSV)
+        nmredata_content += f">  <SMILES>\n{row['SMILES']}\n\n"
         
-        # Add multiplicity
-        line += f", {peak['multiplicity']}"
+        # Canonical SMILES
+        try:
+            canonical_smiles = Chem.MolToSmiles(mol_3d, canonical=True)
+            nmredata_content += f">  <Canonical_SMILES>\n{canonical_smiles}\n\n"
+        except Exception as e:
+            logger.warning(f"Could not generate canonical SMILES for {row['NP_MRD_ID']}: {e}")
         
-        # Add coupling constants in a consistent format
-        if peak['coupling']:
-            # Format all J values consistently
-            # Sort in descending order for consistency
-            sorted_couplings = sorted(peak['coupling'], reverse=True)
+        # Isomeric SMILES (preserves stereochemistry)
+        try:
+            isomeric_smiles = Chem.MolToSmiles(mol_3d, isomericSmiles=True)
+            nmredata_content += f">  <Isomeric_SMILES>\n{isomeric_smiles}\n\n"
+        except Exception as e:
+            logger.warning(f"Could not generate isomeric SMILES for {row['NP_MRD_ID']}: {e}")
+        
+        # InChI and InChIKey
+        try:
+            inchi = Chem.MolToInchi(mol_3d)
+            nmredata_content += f">  <InChI>\n{inchi}\n\n"
             
-            # Group similar J values (within 0.1 Hz tolerance)
-            grouped_couplings = self._group_similar_couplings(sorted_couplings)
-            
-            # Format as J=value
-            coupling_strs = []
-            for j_value, count in grouped_couplings:
-                if count > 1:
-                    # Multiple identical couplings (e.g., J=7.5x2)
-                    coupling_strs.append(f"J={j_value:.1f}x{count}")
-                else:
-                    coupling_strs.append(f"J={j_value:.1f}")
-            
-            line += f", {', '.join(coupling_strs)}"
+            inchi_key = Chem.MolToInchiKey(mol_3d)
+            nmredata_content += f">  <InChIKey>\n{inchi_key}\n\n"
+        except Exception as e:
+            logger.warning(f"Could not generate InChI for {row['NP_MRD_ID']}: {e}")
         
-        # Add atom numbers
-        atom_numbers = sorted(peak['atom_numbers'])
+        # Molecular Formula
+        try:
+            formula = rdMolDescriptors.CalcMolFormula(mol_3d)
+            nmredata_content += f">  <Molecular_Formula>\n{formula}\n\n"
+        except:
+            pass
         
-        # Format atom numbers efficiently
-        atom_range = self._format_atom_range(atom_numbers)
-        line += f", {atom_range}"
+        # Molecular Weight
+        try:
+            mw = Descriptors.ExactMolWt(mol_3d)
+            nmredata_content += f">  <Molecular_Weight>\n{mw:.4f}\n\n"
+        except:
+            pass
         
-        # Add total count
-        line += f", {peak['count']}"
+        # Atom and peak counts for validation
+        h_atoms = sum(1 for atom in mol_3d.GetAtoms() if atom.GetSymbol() == 'H')
+        c_atoms = sum(1 for atom in mol_3d.GetAtoms() if atom.GetSymbol() == 'C')
+        h_peaks_count = len(h_peaks)
+        c_peaks_count = len(c_peaks)
+        h_real_peaks = len([p for p in h_peaks if p['shift'] is not None])
+        c_real_peaks = len([p for p in c_peaks if p['shift'] is not None])
+        h_padded = h_peaks_count - h_real_peaks
+        c_padded = c_peaks_count - c_real_peaks
         
-        return line
-    
-    def _group_similar_couplings(self, couplings, tolerance=0.1):
-        """Group similar coupling constants within tolerance"""
-        if not couplings:
-            return []
+        # Determine if this is complete data (no padding)
+        is_complete = (h_padded == 0 and c_padded == 0)
         
-        grouped = []
-        current_value = couplings[0]
-        count = 1
+        nmredata_content += f">  <Atom_Peak_Counts>\nH_atoms: {h_atoms}\n"
+        nmredata_content += f"H_peaks_total: {h_peaks_count}\n"
+        nmredata_content += f"H_peaks_real: {h_real_peaks}\n"
+        nmredata_content += f"H_peaks_padded: {h_padded}\n"
+        nmredata_content += f"C_atoms: {c_atoms}\n"
+        nmredata_content += f"C_peaks_total: {c_peaks_count}\n"
+        nmredata_content += f"C_peaks_real: {c_real_peaks}\n"
+        nmredata_content += f"C_peaks_padded: {c_padded}\n\n"
         
-        for i in range(1, len(couplings)):
-            if abs(couplings[i] - current_value) <= tolerance:
-                # Similar value, increment count
-                count += 1
-            else:
-                # Different value, save current group
-                grouped.append((current_value, count))
-                current_value = couplings[i]
-                count = 1
-        
-        # Don't forget the last group
-        grouped.append((current_value, count))
-        
-        return grouped
-    
-    def _format_atom_range(self, atom_numbers):
-        """Format atom numbers as ranges where possible"""
-        if not atom_numbers:
-            return ""
-        
-        if len(atom_numbers) == 1:
-            return str(atom_numbers[0])
-        
-        # Find consecutive sequences
-        ranges = []
-        start = atom_numbers[0]
-        end = atom_numbers[0]
-        
-        for i in range(1, len(atom_numbers)):
-            if atom_numbers[i] == end + 1:
-                # Consecutive, extend range
-                end = atom_numbers[i]
-            else:
-                # Not consecutive, save current range
-                if start == end:
-                    ranges.append(str(start))
-                elif end - start == 1:
-                    # Just two numbers, list them
-                    ranges.append(f"{start},{end}")
-                else:
-                    # Range of 3 or more
-                    ranges.append(f"{start}-{end}")
-                
-                start = atom_numbers[i]
-                end = atom_numbers[i]
-        
-        # Handle the last range
-        if start == end:
-            ranges.append(str(start))
-        elif end - start == 1:
-            ranges.append(f"{start},{end}")
+        # Add explicit data completeness label
+        nmredata_content += f">  <DATA_COMPLETENESS>\n"
+        if is_complete:
+            nmredata_content += "COMPLETE - No padding required\n"
+            nmredata_content += "Suitable for: TEST SET\n"
         else:
-            ranges.append(f"{start}-{end}")
+            nmredata_content += "INCOMPLETE - Padding added\n"
+            nmredata_content += "Suitable for: TRAINING SET\n"
+        nmredata_content += f"Total_peaks_padded: {h_padded + c_padded}\n\n"
         
-        # Combine all ranges
-        return ','.join(ranges)
-    
-    def _create_metadata(self, row):
-        """Create metadata section for NMReDATA"""
-        metadata = f""">  <NMREDATA_SOLVENT>
+        # Additional metadata
+        nmredata_content += f""">  <NMREDATA_SOLVENT>
 Unknown
 
 >  <NMREDATA_TEMPERATURE>
@@ -193,36 +176,34 @@ Unknown
 >  <NP_MRD_ID>
 {row['NP_MRD_ID']}
 
->  <SMILES>
-{row['SMILES']}
+>  <Natural_Products_Name>
+{row['Natural_Products_Name']}
 
 $$$$
 """
-        return metadata
+        
+        return nmredata_content
     
-    def format_peak_summary(self, peak):
-        """Create a human-readable summary of a consolidated peak"""
-        summary = f"{peak['shift']:.3f} ppm: "
+    def _format_peak_line(self, peak):
+        """
+        Format a single peak line for NMReDATA
+        Handles both real peaks and padded (null) peaks
+        """
+        # Handle padded peaks with null shifts
+        if peak['shift'] is None:
+            # Format: NULL, null, , -1
+            # -1 indicates unknown atom assignment (not a false mapping)
+            return f"NULL, null, , -1"
         
-        # Add atom info
-        if peak['count'] == 1:
-            summary += f"atom {peak['atom_numbers'][0]}"
-        else:
-            atom_range = self._format_atom_range(sorted(peak['atom_numbers']))
-            summary += f"{peak['count']} atoms ({atom_range})"
+        # Normal peak formatting
+        line = f"{peak['shift']}, {peak['multiplicity']}"
         
-        # Add multiplicity
-        summary += f", {peak['multiplicity']}"
+        # Add coupling constants
+        if peak.get('coupling'):
+            coupling_str = ', '.join([f"J={c}" for c in peak['coupling']])
+            line += f", {coupling_str}"
         
-        # Add coupling info
-        if peak['coupling']:
-            grouped = self._group_similar_couplings(sorted(peak['coupling'], reverse=True))
-            j_parts = []
-            for j_val, count in grouped:
-                if count > 1:
-                    j_parts.append(f"{j_val:.1f} Hz (×{count})")
-                else:
-                    j_parts.append(f"{j_val:.1f} Hz")
-            summary += f", J = {', '.join(j_parts)}"
+        # Add atom number (no count needed since each peak = 1 atom)
+        line += f", {peak['atom_number']}"
         
-        return summary
+        return line
