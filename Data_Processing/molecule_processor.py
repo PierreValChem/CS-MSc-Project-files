@@ -10,7 +10,7 @@ from collections import defaultdict
 
 # Import setup_logging first before using it
 try:
-    from Data_Processing.utils import setup_logging
+    from utils import setup_logging
     logger = setup_logging()
 except ImportError:
     # Fallback if utils is not available yet

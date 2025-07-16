@@ -12,7 +12,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 try:
-    from Data_Processing.utils import setup_logging
+    from utils import setup_logging
     logger = setup_logging()
 except ImportError:
     logging.basicConfig(level=logging.INFO)

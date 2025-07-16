@@ -5,7 +5,7 @@ Validation functions for NMReDATA files
 import os
 import glob
 import logging
-from Data_Processing.utils import setup_logging
+from utils import setup_logging
 
 logger = setup_logging()
 

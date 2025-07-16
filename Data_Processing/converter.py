@@ -1,5 +1,6 @@
 """
 Core converter class for NMReDATA conversion
+Updated to disable consolidation, require H NMR, and add all molecular representations
 """
 
 import pandas as pd
@@ -12,10 +13,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import logging
 
-from Data_Processing.molecule_processor import MoleculeProcessor
-from Data_Processing.nmr_parser import NMRParser
-from Data_Processing.nmredata_writer import NMReDataWriter
-from Data_Processing.utils import setup_logging
+from molecule_processor import MoleculeProcessor
+from nmr_parser import NMRParser
+from nmredata_writer import NMReDataWriter
+from utils import setup_logging
 
 logger = setup_logging()
 
@@ -61,6 +62,7 @@ class CSVToNMReDATA:
             'total_compounds': 0,
             'compounds_with_nmr': 0,
             'compounds_without_nmr': 0,
+            'compounds_without_h_nmr': 0,
             'txt_files_found': 0,
             'txt_files_missing': 0,
             'valid_smiles': 0,
@@ -71,7 +73,8 @@ class CSVToNMReDATA:
             'empty_peaklists': 0,
             'atom_mapping_success': 0,
             'atom_mapping_failed': 0,
-            'consolidation_warnings': 0,
+            'h_nmr_completeness_warnings': 0,
+            'c_nmr_completeness_warnings': 0,
             'nmredata_created': 0,
             'empty_mol_blocks': 0,
             'processing_errors': [],
@@ -142,7 +145,7 @@ class CSVToNMReDATA:
         return None
     
     def _load_and_precheck_data(self, csv_file):
-        """Load CSV and pre-check for NMR data availability"""
+        """Load CSV and pre-check for NMR data availability with H NMR validation"""
         try:
             df = pd.read_csv(csv_file)
             
@@ -164,15 +167,28 @@ class CSVToNMReDATA:
             
             logger.info(f"Loaded {len(df)} compounds from CSV")
             
-            # Pre-check for NMR data files
-            logger.info("Pre-checking for NMR data availability...")
+            # Pre-check for NMR data files with H NMR validation
+            logger.info("Pre-checking for NMR data availability and H NMR presence...")
             compounds_with_nmr = []
             compounds_without_nmr = []
+            compounds_without_h_nmr = []
             
             for idx, row in df.iterrows():
                 np_id = row['NP_MRD_ID']
-                if self.find_txt_file(np_id):
-                    compounds_with_nmr.append(idx)
+                txt_file = self.find_txt_file(np_id)
+                
+                if txt_file:
+                    # Parse to check for H NMR
+                    peaks = self.nmr_parser.parse_peaklist(txt_file)
+                    if peaks:
+                        h_peaks = [p for p in peaks if p['element'] == 'H']
+                        if h_peaks:
+                            compounds_with_nmr.append(idx)
+                        else:
+                            compounds_without_h_nmr.append(idx)
+                            logger.debug(f"No H NMR data for {np_id} - will be skipped")
+                    else:
+                        compounds_without_nmr.append(idx)
                 else:
                     compounds_without_nmr.append(idx)
                     logger.debug(f"No NMR data found for {np_id}")
@@ -180,13 +196,15 @@ class CSVToNMReDATA:
             # Update metrics
             self.metrics['compounds_with_nmr'] = len(compounds_with_nmr)
             self.metrics['compounds_without_nmr'] = len(compounds_without_nmr)
+            self.metrics['compounds_without_h_nmr'] = len(compounds_without_h_nmr)
             
             # Log summary
             logger.info(f"Pre-check complete:")
-            logger.info(f"  - Compounds with NMR data: {len(compounds_with_nmr)}")
+            logger.info(f"  - Compounds with NMR data (including H NMR): {len(compounds_with_nmr)}")
             logger.info(f"  - Compounds without NMR data: {len(compounds_without_nmr)}")
+            logger.info(f"  - Compounds without H NMR data: {len(compounds_without_h_nmr)}")
             
-            # Save list of compounds without NMR data
+            # Save lists
             if compounds_without_nmr:
                 missing_nmr_file = os.path.join(self.output_directory, 'compounds_without_nmr.txt')
                 with open(missing_nmr_file, 'w', encoding='utf-8') as f:
@@ -196,11 +214,20 @@ class CSVToNMReDATA:
                         f.write(f"{row['NP_MRD_ID']},{row['Natural_Products_Name']}\n")
                 logger.info(f"List of compounds without NMR data saved to: {missing_nmr_file}")
             
-            # Filter to only compounds with NMR data
+            if compounds_without_h_nmr:
+                missing_h_nmr_file = os.path.join(self.output_directory, 'compounds_without_h_nmr.txt')
+                with open(missing_h_nmr_file, 'w', encoding='utf-8') as f:
+                    f.write("NP_MRD_ID,Natural_Products_Name\n")
+                    for idx in compounds_without_h_nmr:
+                        row = df.iloc[idx]
+                        f.write(f"{row['NP_MRD_ID']},{row['Natural_Products_Name']}\n")
+                logger.info(f"List of compounds without H NMR data saved to: {missing_h_nmr_file}")
+            
+            # Filter to only compounds with H NMR data
             df_with_nmr = df.iloc[compounds_with_nmr].copy()
             self.metrics['total_compounds'] = len(df_with_nmr)
             
-            logger.info(f"Processing {len(df_with_nmr)} compounds with NMR data")
+            logger.info(f"Processing {len(df_with_nmr)} compounds with H NMR data")
             
             return df_with_nmr
             
@@ -209,15 +236,17 @@ class CSVToNMReDATA:
             raise
     
     def process_compound(self, row):
-        """Process a single compound - thread-safe method"""
+        """Process a single compound - thread-safe method WITHOUT consolidation"""
         compound_metrics = {
             'txt_found': False,
             'valid_smiles': False,
             '3d_generated': False,
             'peaks_found': False,
+            'h_nmr_found': False,
             'atom_mapped': False,
-            'consolidation_ok': True,
-            'mol_block_valid': False
+            'mol_block_valid': False,
+            'h_nmr_complete': False,
+            'c_nmr_complete': False
         }
         
         try:
@@ -242,10 +271,22 @@ class CSVToNMReDATA:
                 logger.warning(f"No peaks found for {np_id}")
                 with self.lock:
                     self.metrics['empty_peaklists'] += 1
-            else:
-                compound_metrics['peaks_found'] = True
-                with self.lock:
-                    self.metrics['peaks_parsed'] += 1
+                return False, f"No peaks found for {np_id}", compound_metrics
+            
+            compound_metrics['peaks_found'] = True
+            with self.lock:
+                self.metrics['peaks_parsed'] += 1
+            
+            # Check for H NMR (should exist due to pre-check)
+            h_peaks = [p for p in peaks if p['element'] == 'H']
+            if not h_peaks:
+                logger.error(f"No H NMR peaks for {np_id} (should have been filtered)")
+                return False, f"No H NMR data for {np_id}", compound_metrics
+            
+            compound_metrics['h_nmr_found'] = True
+            
+            # Get C peaks
+            c_peaks = [p for p in peaks if p['element'] == 'C']
             
             # Generate molecule from SMILES
             mol = self.molecule_processor.smiles_to_mol(row['SMILES'])
@@ -272,7 +313,25 @@ class CSVToNMReDATA:
                 with self.lock:
                     self.metrics['3d_generation_success'] += 1
             
-            # Create atom mapping
+            # Validate peak count completeness
+            mol_h_count = sum(1 for atom in mol_3d.GetAtoms() if atom.GetSymbol() == 'H')
+            mol_c_count = sum(1 for atom in mol_3d.GetAtoms() if atom.GetSymbol() == 'C')
+            
+            if len(h_peaks) == mol_h_count:
+                compound_metrics['h_nmr_complete'] = True
+            else:
+                logger.warning(f"H NMR incomplete for {np_id}: {len(h_peaks)} peaks vs {mol_h_count} H atoms")
+                with self.lock:
+                    self.metrics['h_nmr_completeness_warnings'] += 1
+            
+            if len(c_peaks) == mol_c_count:
+                compound_metrics['c_nmr_complete'] = True
+            else:
+                logger.warning(f"C NMR incomplete for {np_id}: {len(c_peaks)} peaks vs {mol_c_count} C atoms")
+                with self.lock:
+                    self.metrics['c_nmr_completeness_warnings'] += 1
+            
+            # Create atom mapping if possible
             if mol_3d and peaks:
                 atom_mapping = self.molecule_processor.create_atom_mapping(peaks, mol_3d)
                 if atom_mapping:
@@ -285,27 +344,10 @@ class CSVToNMReDATA:
                     with self.lock:
                         self.metrics['atom_mapping_failed'] += 1
             
-            # Consolidate peaks
-            h_peaks = [p for p in peaks if p['element'] == 'H']
-            c_peaks = [p for p in peaks if p['element'] == 'C']
-            
-            h_peaks_consolidated = self.nmr_parser.consolidate_equivalent_peaks(h_peaks)
-            c_peaks_consolidated = self.nmr_parser.consolidate_equivalent_peaks(c_peaks)
-            
-            # Check for consolidation warnings
-            if not self.nmr_parser.validate_peak_consolidation(h_peaks, h_peaks_consolidated):
-                with self.lock:
-                    self.metrics['consolidation_warnings'] += 1
-                compound_metrics['consolidation_ok'] = False
-            
-            if not self.nmr_parser.validate_peak_consolidation(c_peaks, c_peaks_consolidated):
-                with self.lock:
-                    self.metrics['consolidation_warnings'] += 1
-                compound_metrics['consolidation_ok'] = False
-            
-            # Create NMReDATA content
-            nmredata_content = self.nmredata_writer.create_nmredata_file(
-                row, h_peaks_consolidated, c_peaks_consolidated, mol_3d
+            # DO NOT CONSOLIDATE - use peaks directly
+            # Create enhanced NMReDATA content with all molecular representations
+            nmredata_content = self.nmredata_writer.create_enhanced_nmredata_file(
+                row, h_peaks, c_peaks, mol_3d
             )
             
             # Check if content is valid (not None and has proper MOL block)

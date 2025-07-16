@@ -1,18 +1,18 @@
 """
-NMR data parsing and peak consolidation module
+NMR data parsing module - Updated to disable consolidation
 """
 
 import os
 import logging
 from collections import defaultdict
 import re
-from Data_Processing.utils import setup_logging
+from utils import setup_logging
 
 logger = setup_logging()
 
 
 class NMRParser:
-    """Handles NMR peak list parsing and consolidation"""
+    """Handles NMR peak list parsing WITHOUT consolidation"""
     
     def __init__(self):
         # Extended list of valid multiplicities
@@ -242,103 +242,17 @@ class NMRParser:
         return coupling
     
     def consolidate_equivalent_peaks(self, peaks):
-        """Enhanced consolidation for better machine learning compatibility"""
-        if not peaks:
-            return []
-        
-        # Group peaks by chemical shift only (ignoring multiplicity for grouping)
-        # This ensures all peaks with the same shift are on the same line
-        shift_groups = defaultdict(list)
-        
-        for peak in peaks:
-            # Use very high precision for grouping (4 decimal places)
-            rounded_shift = round(peak['shift'], 4)
-            shift_groups[rounded_shift].append(peak)
-        
-        # Build consolidated peaks
-        consolidated = []
-        
-        for rounded_shift, peak_group in shift_groups.items():
-            # Collect all unique multiplicities and couplings
-            all_multiplicities = []
-            all_couplings = []
-            atom_numbers = []
-            
-            for peak in peak_group:
-                atom_numbers.append(peak['atom_number'])
-                
-                # Collect multiplicity
-                if peak['multiplicity'] not in all_multiplicities:
-                    all_multiplicities.append(peak['multiplicity'])
-                
-                # Collect coupling constants
-                for j in peak['coupling']:
-                    if j not in all_couplings:
-                        all_couplings.append(j)
-            
-            # Use the original shift from the first peak (not rounded)
-            original_shift = peak_group[0]['shift']
-            
-            # Combine multiplicities if multiple exist
-            if len(all_multiplicities) == 1:
-                combined_multiplicity = all_multiplicities[0]
-            elif len(all_multiplicities) > 1:
-                # Join unique multiplicities
-                combined_multiplicity = '/'.join(sorted(set(all_multiplicities)))
-            else:
-                combined_multiplicity = 'm'
-            
-            # Sort coupling constants
-            all_couplings = sorted(all_couplings, reverse=True)
-            
-            consolidated_peak = {
-                'element': peak_group[0]['element'],
-                'shift': original_shift,
-                'multiplicity': combined_multiplicity,
-                'coupling': all_couplings,
-                'atom_numbers': sorted(atom_numbers),
-                'count': len(atom_numbers)
-            }
-            
-            consolidated.append(consolidated_peak)
-        
-        # Sort by chemical shift
-        consolidated.sort(key=lambda x: x['shift'], reverse=True)
-        
-        # Log consolidation for debugging
-        logger.debug(f"Consolidated {len(peaks)} peaks to {len(consolidated)} unique shifts")
-        for c_peak in consolidated:
-            if c_peak['count'] > 1:
-                logger.debug(f"  {c_peak['shift']:.4f} ppm ({c_peak['multiplicity']}): "
-                           f"atoms {c_peak['atom_numbers']} ({c_peak['count']} atoms)")
-                if c_peak['coupling']:
-                    logger.debug(f"    J-couplings: {', '.join(f'{j:.1f}' for j in c_peak['coupling'])} Hz")
-        
-        return consolidated
+        """
+        DEPRECATED: This method consolidates peaks. In the new system, we do NOT consolidate.
+        Returns peaks as-is without any consolidation.
+        """
+        logger.warning("consolidate_equivalent_peaks called - returning peaks without consolidation")
+        return peaks
     
     def validate_peak_consolidation(self, original_peaks, consolidated_peaks):
-        """Validate that peak consolidation is correct and complete"""
-        # Check that no atoms were lost
-        original_atoms = set()
-        for peak in original_peaks:
-            original_atoms.add(peak['atom_number'])
-        
-        consolidated_atoms = set()
-        for peak in consolidated_peaks:
-            consolidated_atoms.update(peak['atom_numbers'])
-        
-        if original_atoms != consolidated_atoms:
-            missing = original_atoms - consolidated_atoms
-            extra = consolidated_atoms - original_atoms
-            if missing:
-                logger.warning(f"Missing atoms after consolidation: {missing}")
-            if extra:
-                logger.warning(f"Extra atoms after consolidation: {extra}")
-            return False
-        
-        # With the new consolidation strategy, we only need to check atom preservation
-        # since we're grouping by shift alone
-        
+        """
+        DEPRECATED: Validation for consolidation. Always returns True in non-consolidation mode.
+        """
         return True
     
     def renumber_peaklist(self, peaks, atom_mapping):
@@ -358,18 +272,60 @@ class NMRParser:
         return renumbered_peaks
     
     def format_consolidated_peak_info(self, consolidated_peak):
-        """Format consolidated peak information for logging or display"""
-        info = f"{consolidated_peak['shift']:.4f} ppm"
-        
-        if consolidated_peak['count'] > 1:
-            info += f" ({consolidated_peak['count']} atoms: {consolidated_peak['atom_numbers']})"
+        """Format peak information for logging or display (non-consolidated version)"""
+        if 'atom_numbers' in consolidated_peak:
+            # Old consolidated format
+            atom_nums = consolidated_peak['atom_numbers']
+            if len(atom_nums) == 1:
+                info = f"{consolidated_peak['shift']:.4f} ppm (atom {atom_nums[0]})"
+            else:
+                info = f"{consolidated_peak['shift']:.4f} ppm (atoms {atom_nums})"
         else:
-            info += f" (atom {consolidated_peak['atom_numbers'][0]})"
+            # Individual peak format
+            info = f"{consolidated_peak['shift']:.4f} ppm (atom {consolidated_peak['atom_number']})"
         
-        info += f", {consolidated_peak['multiplicity']}"
+        info += f", {consolidated_peak.get('multiplicity', 's')}"
         
-        if consolidated_peak['coupling']:
+        if consolidated_peak.get('coupling'):
             j_str = ', '.join(f"J={j:.1f}" for j in consolidated_peak['coupling'])
             info += f", {j_str}"
         
         return info
+    
+    def validate_nmr_completeness(self, peaks, mol_3d):
+        """Validate that NMR data is complete (all atoms have peaks)"""
+        from rdkit import Chem
+        
+        # Count atoms in molecule
+        atom_counts = {}
+        for atom in mol_3d.GetAtoms():
+            symbol = atom.GetSymbol()
+            atom_counts[symbol] = atom_counts.get(symbol, 0) + 1
+        
+        # Count peaks
+        peak_counts = {}
+        for peak in peaks:
+            element = peak['element']
+            peak_counts[element] = peak_counts.get(element, 0) + 1
+        
+        # Check completeness
+        complete = True
+        warnings = []
+        
+        # Check H NMR
+        if 'H' in atom_counts:
+            h_atoms = atom_counts['H']
+            h_peaks = peak_counts.get('H', 0)
+            if h_peaks != h_atoms:
+                complete = False
+                warnings.append(f"H NMR incomplete: {h_peaks} peaks for {h_atoms} H atoms")
+        
+        # Check C NMR
+        if 'C' in atom_counts:
+            c_atoms = atom_counts['C']
+            c_peaks = peak_counts.get('C', 0)
+            if c_peaks != c_atoms:
+                complete = False
+                warnings.append(f"C NMR incomplete: {c_peaks} peaks for {c_atoms} C atoms")
+        
+        return complete, warnings
