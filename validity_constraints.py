@@ -204,30 +204,17 @@ class ValidatedSMILESGenerator:
 
 
 class ValidityAwareLoss(nn.Module):
-    """Enhanced loss function with stronger validity enforcement"""
+    """Simplified loss function with strong validity enforcement"""
     
-    def __init__(self, base_criterion, validity_weight=0.5, invalid_token_penalty=0.1):
+    def __init__(self, base_criterion, validity_weight=1.0):
         super().__init__()
         self.base_criterion = base_criterion
         self.validity_weight = validity_weight
-        self.invalid_token_penalty = invalid_token_penalty
         self.validator = MoleculeValidator()
-        
-        # Common invalid patterns in SMILES
-        self.invalid_patterns = {
-            '((': 0.2,  # Double open parenthesis
-            '))': 0.2,  # Double close parenthesis
-            '==': 0.2,  # Invalid double bond
-            '##': 0.2,  # Invalid triple bond
-            ']]': 0.2,  # Double close bracket
-            '[[': 0.2,  # Double open bracket
-            'CC(C)(C)(C)C': 0.5,  # Carbon with 5 bonds
-            'O(O)(O)': 0.5,  # Oxygen with 3 bonds
-        }
     
     def forward(self, outputs, targets, predictions=None):
         """
-        Calculate loss with enhanced validity penalties
+        Calculate loss with validity penalty
         
         Args:
             outputs: Model logits [batch, seq_len, vocab_size]
@@ -240,47 +227,60 @@ class ValidityAwareLoss(nn.Module):
             targets.reshape(-1)
         )
         
-        # Enhanced validity penalty
+        # Simple validity penalty
         if predictions is not None:
-            validity_penalty = 0.0
-            pattern_penalty = 0.0
+            invalid_count = 0
             batch_size = len(predictions)
             
             for pred_smiles in predictions:
-                # Check overall validity
+                # Check if SMILES is valid
                 if not self.validator.is_valid_smiles(pred_smiles):
-                    validity_penalty += 1.0
-                    
-                    # Add extra penalty for specific invalid patterns
-                    for pattern, penalty in self.invalid_patterns.items():
-                        if pattern in pred_smiles:
-                            pattern_penalty += penalty
-                
-                # Penalize unbalanced parentheses/brackets
-                open_paren = pred_smiles.count('(')
-                close_paren = pred_smiles.count(')')
-                open_bracket = pred_smiles.count('[')
-                close_bracket = pred_smiles.count(']')
-                
-                if open_paren != close_paren:
-                    pattern_penalty += 0.3 * abs(open_paren - close_paren)
-                if open_bracket != close_bracket:
-                    pattern_penalty += 0.3 * abs(open_bracket - close_bracket)
+                    invalid_count += 1
             
-            validity_penalty = validity_penalty / batch_size
-            pattern_penalty = pattern_penalty / batch_size
+            # Strong penalty for invalid molecules
+            validity_penalty = (invalid_count / batch_size) * 2.0  # 2x penalty
             
-            # Combined loss with stronger validity enforcement
-            total_loss = base_loss + self.validity_weight * validity_penalty + self.invalid_token_penalty * pattern_penalty
+            # Combined loss
+            total_loss = base_loss + self.validity_weight * validity_penalty
             
             return total_loss, {
                 'base_loss': base_loss.item(),
                 'validity_penalty': validity_penalty,
-                'pattern_penalty': pattern_penalty,
-                'validity_rate': 1.0 - validity_penalty
+                'validity_rate': 1.0 - (invalid_count / batch_size)
             }
         
         return base_loss, {'base_loss': base_loss.item()}
+
+# Also add a function to pre-filter training data for valid SMILES:
+def filter_valid_smiles(data_list, logger=None):
+    """Filter out invalid SMILES from training data"""
+    from rdkit import Chem
+    
+    valid_data = []
+    invalid_count = 0
+    
+    for data in data_list:
+        smiles = data.get('canonical_smiles', '')
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                # Additional check - ensure it can be converted back
+                canonical_smiles = Chem.MolToSmiles(mol)
+                if canonical_smiles:
+                    data['canonical_smiles'] = canonical_smiles  # Use canonical form
+                    valid_data.append(data)
+                else:
+                    invalid_count += 1
+            else:
+                invalid_count += 1
+        except:
+            invalid_count += 1
+    
+    if logger:
+        logger.info(f"Filtered dataset: {len(data_list)} -> {len(valid_data)} "
+                   f"({invalid_count} invalid SMILES removed)")
+    
+    return valid_data
 
 
 class ConstrainedDecoding:
