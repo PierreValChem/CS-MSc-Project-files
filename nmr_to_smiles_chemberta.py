@@ -647,7 +647,7 @@ class NMRToSMILES(nn.Module):
         return mask
     
     def _generate_valid_forced(self, nmr_encoding, tokenizer, max_length=256, temperature=0.8, 
-                              max_attempts=50, beam_size=5):
+                            max_attempts=50, beam_size=5):
         """
         Generate SMILES with forced validity using multiple strategies
         """
@@ -660,105 +660,151 @@ class NMRToSMILES(nn.Module):
             rdkit_available = True
         except ImportError:
             rdkit_available = False
+            logger.warning("RDKit not available for validity checking")
         
-        # Strategy 1: Constrained beam search with validity checking
+        # Strategy 1: Try simple generation first with validity check
+        for attempt in range(min(5, max_attempts)):
+            generated = self._generate(nmr_encoding, tokenizer, max_length, temperature)
+            smiles = tokenizer.decode(generated[0], skip_special_tokens=True)
+            
+            if rdkit_available:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    return generated
+        
+        # Strategy 2: Constrained beam search with validity checking
         best_valid_smiles = None
         best_score = float('-inf')
         
         # Get special token IDs from tokenizer
-        pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0
-        eos_token_id = tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 2
+        pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
+        eos_token_id = getattr(tokenizer, 'eos_token_id', 2)
         
-        for beam_idx in range(beam_size):
+        for beam_idx in range(min(3, beam_size)):  # Limit beam search attempts
             beams = [{
                 'tokens': torch.zeros((1,), dtype=torch.long, device=device),
                 'score': 0.0,
                 'smiles': ''
             }]
             
-            for step in range(max_length - 1):
+            for step in range(min(50, max_length)):  # Limit steps to avoid hanging
                 new_beams = []
                 
-                for beam in beams:
+                for beam in beams[:5]:  # Limit beams per step
                     if len(beam['tokens']) >= max_length - 1:
                         continue
                     
                     # Get next token probabilities
-                    positions = torch.arange(beam['tokens'].size(0), device=device).unsqueeze(0)
-                    token_emb = self.token_embedding(beam['tokens'].unsqueeze(0))
-                    pos_emb = self.position_embedding(positions)
-                    target_emb = self.dropout(token_emb + pos_emb)
-                    
-                    target_emb = target_emb.transpose(0, 1)
-                    decoded = self.decoder(target_emb, nmr_encoding)
-                    
-                    logits = self.output_projection(decoded[-1]) / temperature
-                    probs = torch.softmax(logits, dim=-1)
-                    
-                    # Sample top k tokens
-                    k = min(10, probs.size(-1))
-                    top_probs, top_indices = torch.topk(probs[0], k)
-                    
-                    for idx in range(k):
-                        token_id = top_indices[idx].item()
-                        token_prob = top_probs[idx].item()
+                    try:
+                        positions = torch.arange(beam['tokens'].size(0), device=device).unsqueeze(0)
+                        token_emb = self.token_embedding(beam['tokens'].unsqueeze(0))
+                        pos_emb = self.position_embedding(positions)
+                        target_emb = self.dropout(token_emb + pos_emb)
                         
-                        # Skip if it's padding token
-                        if token_id == pad_token_id:
-                            continue
+                        target_emb = target_emb.transpose(0, 1)
+                        decoded = self.decoder(target_emb, nmr_encoding)
                         
-                        new_tokens = torch.cat([beam['tokens'], torch.tensor([token_id], device=device)])
+                        logits = self.output_projection(decoded[-1]) / temperature
+                        probs = torch.softmax(logits, dim=-1)
                         
-                        # Decode to check validity
-                        new_smiles = tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+                        # Sample top k tokens
+                        k = min(5, probs.size(-1))
+                        top_probs, top_indices = torch.topk(probs[0], k)
                         
-                        # Check if it's the end token
-                        if token_id == eos_token_id:
-                            # Validate complete SMILES
-                            if rdkit_available and self._is_valid_smiles(new_smiles):
-                                if beam['score'] + np.log(token_prob) > best_score:
-                                    best_score = beam['score'] + np.log(token_prob)
-                                    best_valid_smiles = new_smiles
-                            continue
-                        
-                        # Quick validity checks for partial SMILES
-                        if self._is_valid_partial_smiles(new_smiles):
-                            new_beams.append({
-                                'tokens': new_tokens,
-                                'score': beam['score'] + np.log(token_prob),
-                                'smiles': new_smiles
-                            })
+                        for idx in range(k):
+                            token_id = top_indices[idx].item()
+                            token_prob = top_probs[idx].item()
+                            
+                            # Skip if it's padding token
+                            if token_id == pad_token_id:
+                                continue
+                            
+                            new_tokens = torch.cat([beam['tokens'], torch.tensor([token_id], device=device)])
+                            
+                            # Decode to check validity
+                            new_smiles = tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+                            
+                            # Check if it's the end token
+                            if token_id == eos_token_id:
+                                if rdkit_available:
+                                    mol = Chem.MolFromSmiles(new_smiles)
+                                    if mol is not None and beam['score'] + np.log(token_prob) > best_score:
+                                        best_score = beam['score'] + np.log(token_prob)
+                                        best_valid_smiles = new_smiles
+                                continue
+                            
+                            # Quick validity checks for partial SMILES
+                            if self._is_valid_partial_smiles(new_smiles):
+                                new_beams.append({
+                                    'tokens': new_tokens,
+                                    'score': beam['score'] + np.log(token_prob),
+                                    'smiles': new_smiles
+                                })
+                    except Exception as e:
+                        logger.debug(f"Error in beam search: {e}")
+                        continue
                 
                 # Keep only top beams
-                beams = sorted(new_beams, key=lambda x: x['score'], reverse=True)[:beam_size]
+                beams = sorted(new_beams, key=lambda x: x['score'], reverse=True)[:3]
                 
                 if not beams:
                     break
-            
-            # Check final beams for validity
-            for beam in beams:
-                final_smiles = beam['smiles']
-                if rdkit_available and self._is_valid_smiles(final_smiles) and beam['score'] > best_score:
-                    best_score = beam['score']
-                    best_valid_smiles = final_smiles
         
-        # If no valid SMILES found, try simpler strategies
-        if best_valid_smiles is None:
-            # Strategy 2: Generate multiple samples and pick first valid one
-            for _ in range(max_attempts):
-                generated = self._generate(nmr_encoding, tokenizer, max_length, temperature)
-                smiles = tokenizer.decode(generated[0], skip_special_tokens=True)
-                if rdkit_available and self._is_valid_smiles(smiles):
+        # If we found a valid SMILES, convert it back to tokens
+        if best_valid_smiles is not None:
+            # Use the tokenizer's encode method properly
+            encoded = tokenizer.encode(best_valid_smiles, max_length=max_length)
+            if isinstance(encoded, dict):
+                # Handle dict output from SMILESTokenizer
+                return torch.tensor([encoded['input_ids']], device=device)
+            else:
+                # Handle list output
+                return torch.tensor([encoded], device=device)
+        
+        # Strategy 3: Try more simple generations
+        for _ in range(max_attempts - 5):
+            generated = self._generate(nmr_encoding, tokenizer, max_length, temperature * 0.8)
+            smiles = tokenizer.decode(generated[0], skip_special_tokens=True)
+            
+            if rdkit_available:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
                     return generated
-            
-            # Strategy 3: Return a simple valid default
-            # Convert "C" to token IDs
-            default_tokens = tokenizer.encode("C", add_special_tokens=True)
-            return torch.tensor([default_tokens], device=device)
         
-        # Convert best valid SMILES back to tokens
-        best_tokens = tokenizer.encode(best_valid_smiles, add_special_tokens=True)
-        return torch.tensor([best_tokens], device=device)
+        # Final fallback: Return a simple valid default
+        default_smiles = "C"  # Methane
+        encoded = tokenizer.encode(default_smiles, max_length=max_length)
+        if isinstance(encoded, dict):
+            return torch.tensor([encoded['input_ids']], device=device)
+        else:
+            return torch.tensor([encoded], device=device)
+
+    # Also update the _is_valid_partial_smiles method to be more lenient:
+    def _is_valid_partial_smiles(self, partial_smiles):
+        """Quick checks for partial SMILES validity - more lenient"""
+        if not partial_smiles:
+            return True
+        
+        # Don't check empty or very short strings
+        if len(partial_smiles) < 2:
+            return True
+        
+        # Check balanced parentheses
+        open_paren = partial_smiles.count('(')
+        close_paren = partial_smiles.count(')')
+        if close_paren > open_paren:
+            return False
+        
+        # Check balanced brackets
+        open_bracket = partial_smiles.count('[')
+        close_bracket = partial_smiles.count(']')
+        if close_bracket > open_bracket:
+            return False
+        
+        # Don't check for invalid patterns in partial SMILES
+        # as they might be completed later
+        
+        return True
     
     def _is_valid_smiles(self, smiles):
         """Check if SMILES is valid using RDKit"""
@@ -769,24 +815,6 @@ class NMRToSMILES(nn.Module):
         except:
             return False
     
-    def _is_valid_partial_smiles(self, partial_smiles):
-        """Quick checks for partial SMILES validity"""
-        if not partial_smiles:
-            return True
-        
-        # Check balanced parentheses
-        if partial_smiles.count(')') > partial_smiles.count('('):
-            return False
-        if partial_smiles.count(']') > partial_smiles.count('['):
-            return False
-        
-        # Check for invalid patterns
-        invalid_patterns = ['((', '))', ']]', '[[', '==', '##']
-        for pattern in invalid_patterns:
-            if pattern in partial_smiles:
-                return False
-        
-        return True
     
     # Modify the forward method to accept tokenizer for generation
     def forward(self, h_features, c_features, global_features, 
@@ -1254,6 +1282,70 @@ def main(model_config=None):
     if len(all_data) == 0:
         logger.error("No data found! Check if the files were copied correctly.")
         return
+    
+        # Filter SMILES if validation is enabled
+    if config.get('use_molecule_validation', False):
+        logger.info("Filtering training data for valid SMILES...")
+
+        try:
+            from validity_constraints import filter_valid_smiles
+
+            # Split before filtering so we can track effects on each set
+            train_val_data, test_data = train_test_split(
+                all_data,
+                test_size=config['test_split'], 
+                random_state=42
+            )
+
+            train_data, val_data = train_test_split(
+                train_val_data, 
+                test_size=config['val_split']/(1-config['test_split']),
+                random_state=42
+            )
+
+            original_train_len = len(train_data)
+            original_val_len = len(val_data)
+            original_test_len = len(test_data)
+
+            train_data = filter_valid_smiles(train_data, logger)
+            val_data = filter_valid_smiles(val_data, logger)
+            test_data = filter_valid_smiles(test_data, logger)
+
+            logger.info(f"Train data: {original_train_len} -> {len(train_data)}")
+            logger.info(f"Val data: {original_val_len} -> {len(val_data)}")
+            logger.info(f"Test data: {original_test_len} -> {len(test_data)}")
+
+            if len(train_data) < 10:
+                logger.error("Too few valid training samples! Check your data.")
+                return
+
+        except ImportError:
+            logger.warning("Could not import validity filter. Proceeding with unfiltered data.")
+            # Fallback to normal split
+            train_val_data, test_data = train_test_split(
+                all_data,
+                test_size=config['test_split'], 
+                random_state=42
+            )
+            train_data, val_data = train_test_split(
+                train_val_data, 
+                test_size=config['val_split']/(1-config['test_split']),
+                random_state=42
+            )
+    else:
+        # Default split without filtering
+        train_val_data, test_data = train_test_split(
+            all_data,
+            test_size=config['test_split'], 
+            random_state=42
+        )
+
+        train_data, val_data = train_test_split(
+            train_val_data, 
+            test_size=config['val_split']/(1-config['test_split']),
+            random_state=42
+        )
+
     
     # Split data into train/val/test (80/10/10)
     train_val_data, test_data = train_test_split(
