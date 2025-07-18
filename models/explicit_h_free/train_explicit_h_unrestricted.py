@@ -21,7 +21,7 @@ MODEL_CONFIG = {
     'model_name': 'explicit_h_unrestricted',
     'use_explicit_h': True,
     'use_molecule_validation': False,  # No validation
-    'data_dir': 'C:\\Users\\pierr\\Desktop\\CS MSc Project files\\peaklist\\complete_compounds_only',
+    'data_dir': 'C:\\Users\\pierr\\Desktop\\CS MSc Project files\\peaklist\\fakesmall_expH',
     'rebuild_vocab': False,
 }
 

@@ -756,7 +756,7 @@ class NMRToSMILES(nn.Module):
             encoded = tokenizer.encode(best_valid_smiles, max_length=max_length)
             if isinstance(encoded, dict):
                 # Handle dict output from SMILESTokenizer
-                return torch.tensor([encoded['input_ids']], device=device)
+                return torch.tensor(encoded['input_ids'], device=device).unsqueeze(0)
             else:
                 # Handle list output
                 return torch.tensor([encoded], device=device)
@@ -775,7 +775,7 @@ class NMRToSMILES(nn.Module):
         default_smiles = "C"  # Methane
         encoded = tokenizer.encode(default_smiles, max_length=max_length)
         if isinstance(encoded, dict):
-            return torch.tensor([encoded['input_ids']], device=device)
+            return torch.tensor(encoded['input_ids'], device=device).unsqueeze(0)
         else:
             return torch.tensor([encoded], device=device)
 
