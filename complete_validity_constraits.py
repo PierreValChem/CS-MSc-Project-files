@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Enhanced Valid Molecule Generation Methods for NMR-to-SMILES Model
 Focuses specifically on H and C atom counts from NMR data while allowing other atoms
@@ -755,276 +754,517 @@ class EnhancedNMRToSMILES(nn.Module):
         self.validator = validator
         self.constrained_decoding = constrained_decoding
         
-        # Copy attributes from base model
-        self.nmr_encoder = base_model.nmr_encoder
-        self.token_embedding = base_model.token_embedding
-        self.position_embedding = base_model.position_embedding
-        self.decoder = base_model.decoder
-        self.output_projection = base_model.output_projection
-        self.hidden_dim = base_model.hidden_dim
-        self.dropout = base_model.dropout
-    
-    def forward(self, h_features, c_features, global_features, 
-                target_ids=None, target_mask=None):
-        """Forward pass - same as base model"""
-        return self.base_model(h_features, c_features, global_features, 
-                              target_ids, target_mask)
-    
-    def generate_valid(self, h_features, c_features, global_features, 
-                      max_attempts=10, beam_size=5):
-        """Generate valid SMILES with multiple strategies"""
-        nmr_encoding = self.nmr_encoder(h_features, c_features, global_features)
-        nmr_encoding = nmr_encoding.unsqueeze(0)
-        
-        # Try beam search first
-        generator = ValidatedSMILESGenerator(self, self.base_model.tokenizer, self.validator)
-        results = generator.generate_with_beam_search(
-            nmr_encoding, beam_size=beam_size
+        # Initialize generators
+        self.basic_generator = ValidatedSMILESGenerator(
+            base_model, base_model.tokenizer if hasattr(base_model, 'tokenizer') else None, validator
         )
         
-        if results:
-            return self.base_model.tokenizer.decode(results[0], skip_special_tokens=True)
+        if isinstance(validator, EnhancedMoleculeValidator):
+            self.constrained_generator = ConstrainedSMILESGenerator(
+                base_model, base_model.tokenizer if hasattr(base_model, 'tokenizer') else None, validator
+            )
+        else:
+            self.constrained_generator = None
+    
+    def forward(self, nmr_features, target_smiles=None, nmr_data=None):
+        """
+        Forward pass with optional validity-aware training
         
-        # Fallback to sampling with validity checks
-        for _ in range(max_attempts):
-            generated = generator._generate(nmr_encoding, self.base_model.tokenizer)
-            smiles = self.base_model.tokenizer.decode(generated[0], skip_special_tokens=True)
+        Args:
+            nmr_features: NMR spectral features
+            target_smiles: Target SMILES tokens (for training)
+            nmr_data: Additional NMR data with H and C atom counts
+        """
+        # Base model forward pass
+        if target_smiles is not None:
+            # Training mode
+            outputs = self.base_model(nmr_features, target_smiles)
             
-            if self.validator.is_valid_smiles(smiles):
-                return smiles
+            # Add validity-aware loss if available
+            if hasattr(self.base_model, 'criterion') and nmr_data is not None:
+                # Generate predictions for validation
+                with torch.no_grad():
+                    predictions = self.generate_batch(nmr_features, nmr_data)
+                
+                # Calculate enhanced loss
+                if isinstance(self.base_model.criterion, (AtomCountAwareLoss, ValidityAwareLoss)):
+                    loss, loss_info = self.base_model.criterion(
+                        outputs, target_smiles, predictions, nmr_data
+                    )
+                    return {'outputs': outputs, 'loss': loss, 'loss_info': loss_info}
+            
+            return outputs
+        else:
+            # Inference mode
+            return self.base_model(nmr_features)
+    
+    def generate_batch(self, nmr_features, nmr_data=None, **kwargs):
+        """
+        Generate SMILES for a batch of NMR features
         
-        # If all attempts fail, return the best attempt
-        return smiles
+        Args:
+            nmr_features: Batch of NMR features
+            nmr_data: Optional NMR data with H and C counts
+            **kwargs: Additional generation parameters
+        """
+        batch_size = nmr_features.size(0)
+        generated_smiles = []
+        
+        for i in range(batch_size):
+            single_nmr = nmr_features[i:i+1]
+            
+            if nmr_data is not None and self.constrained_generator is not None:
+                # Use constrained generation with H and C atom counts
+                expected_h = nmr_data.get('h_atoms', [0])[i]
+                expected_c = nmr_data.get('c_atoms', [0])[i]
+                
+                smiles = self.constrained_generator.generate_with_hc_constraints(
+                    single_nmr, expected_h, expected_c, **kwargs
+                )
+            else:
+                # Use basic generation
+                generated_tokens = self.basic_generator.generate_with_beam_search(
+                    single_nmr, **kwargs
+                )
+                smiles = self.basic_generator.tokenizer.decode(
+                    generated_tokens[0], skip_special_tokens=True
+                )
+            
+            generated_smiles.append(smiles)
+        
+        return generated_smiles
+    
+    def generate_single(self, nmr_features, expected_h=None, expected_c=None, **kwargs):
+        """
+        Generate a single SMILES from NMR features
+        
+        Args:
+            nmr_features: Single NMR feature tensor
+            expected_h: Expected hydrogen count from 1H NMR
+            expected_c: Expected carbon count from 13C NMR
+            **kwargs: Additional generation parameters
+        """
+        if expected_h is not None and expected_c is not None and self.constrained_generator is not None:
+            return self.constrained_generator.generate_with_hc_constraints(
+                nmr_features, expected_h, expected_c, **kwargs
+            )
+        else:
+            generated_tokens = self.basic_generator.generate_with_beam_search(
+                nmr_features, **kwargs
+            )
+            return self.basic_generator.tokenizer.decode(
+                generated_tokens[0], skip_special_tokens=True
+            )
 
 
-def create_enhanced_validity_system(model, tokenizer, device='cuda'):
-    """Create complete enhanced validity system focused on H and C atom counting"""
+class ValidationMetrics:
+    """Comprehensive validation metrics for NMR-to-SMILES generation"""
     
-    # Create enhanced validator focused on H and C atoms
-    validator = EnhancedMoleculeValidator(hc_count_tolerance=0.1)
+    def __init__(self, validator: EnhancedMoleculeValidator):
+        self.validator = validator
+        self.reset()
     
-    # Create enhanced loss function
-    base_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    enhanced_loss = AtomCountAwareLoss(
-        base_criterion, 
-        validator,
-        validity_weight=0.3,
-        hc_count_weight=0.4,  # Focuses on H/C from NMR
-        token_weight=0.3
+    def reset(self):
+        """Reset all metrics"""
+        self.total_molecules = 0
+        self.valid_smiles = 0
+        self.valid_molecules = 0
+        self.perfect_hc_matches = 0
+        self.good_hc_matches = 0  # Within tolerance
+        self.reasonable_properties = 0
+        
+        self.h_errors = []
+        self.c_errors = []
+        self.hc_scores = []
+        self.property_scores = []
+        self.combined_scores = []
+        
+        self.validation_details = []
+    
+    def update(self, generated_smiles: List[str], nmr_data: Dict[str, List]):
+        """
+        Update metrics with a batch of generated SMILES
+        
+        Args:
+            generated_smiles: List of generated SMILES strings
+            nmr_data: Dictionary with expected H and C atom counts
+        """
+        expected_h_list = nmr_data.get('h_atoms', [])
+        expected_c_list = nmr_data.get('c_atoms', [])
+        
+        for i, smiles in enumerate(generated_smiles):
+            expected_h = expected_h_list[i] if i < len(expected_h_list) else 0
+            expected_c = expected_c_list[i] if i < len(expected_c_list) else 0
+            
+            # Comprehensive validation
+            validation = self.validator.comprehensive_validation(smiles, expected_h, expected_c)
+            
+            self.total_molecules += 1
+            
+            # Basic validity
+            if validation['is_valid_smiles']:
+                self.valid_smiles += 1
+            
+            if validation['overall_valid']:
+                self.valid_molecules += 1
+            
+            if validation['reasonable_properties']:
+                self.reasonable_properties += 1
+            
+            # H and C count matching
+            if validation['hc_count_match']:
+                self.good_hc_matches += 1
+                
+                # Check for perfect match
+                hc_info = validation.get('hc_info', {})
+                if (hc_info.get('actual_h', 0) == expected_h and 
+                    hc_info.get('actual_c', 0) == expected_c):
+                    self.perfect_hc_matches += 1
+            
+            # Collect scores and errors
+            scores = validation.get('scores', {})
+            self.hc_scores.append(scores.get('hc_count_score', 0))
+            self.property_scores.append(scores.get('property_score', 0))
+            self.combined_scores.append(scores.get('combined_score', 0))
+            
+            # Collect atom count errors
+            hc_info = validation.get('hc_info', {})
+            if 'actual_h' in hc_info and 'actual_c' in hc_info:
+                h_error = abs(hc_info['actual_h'] - expected_h) / max(expected_h, 1)
+                c_error = abs(hc_info['actual_c'] - expected_c) / max(expected_c, 1)
+                self.h_errors.append(h_error)
+                self.c_errors.append(c_error)
+            
+            # Store detailed validation info
+            self.validation_details.append({
+                'smiles': smiles,
+                'expected_h': expected_h,
+                'expected_c': expected_c,
+                'validation': validation
+            })
+    
+    def get_metrics(self) -> Dict[str, float]:
+        """Get comprehensive validation metrics"""
+        if self.total_molecules == 0:
+            return {}
+        
+        metrics = {
+            # Basic rates
+            'validity_rate': self.valid_smiles / self.total_molecules,
+            'overall_valid_rate': self.valid_molecules / self.total_molecules,
+            'reasonable_properties_rate': self.reasonable_properties / self.total_molecules,
+            
+            # H and C matching rates
+            'hc_match_rate': self.good_hc_matches / self.total_molecules,
+            'perfect_hc_match_rate': self.perfect_hc_matches / self.total_molecules,
+            
+            # Average scores
+            'avg_hc_score': np.mean(self.hc_scores) if self.hc_scores else 0,
+            'avg_property_score': np.mean(self.property_scores) if self.property_scores else 0,
+            'avg_combined_score': np.mean(self.combined_scores) if self.combined_scores else 0,
+            
+            # Error statistics
+            'avg_h_error': np.mean(self.h_errors) if self.h_errors else 0,
+            'avg_c_error': np.mean(self.c_errors) if self.c_errors else 0,
+            'median_h_error': np.median(self.h_errors) if self.h_errors else 0,
+            'median_c_error': np.median(self.c_errors) if self.c_errors else 0,
+            
+            # Count statistics
+            'total_molecules': self.total_molecules,
+            'valid_molecules': self.valid_molecules,
+            'perfect_hc_matches': self.perfect_hc_matches
+        }
+        
+        return metrics
+    
+    def get_detailed_report(self) -> str:
+        """Generate a detailed validation report"""
+        metrics = self.get_metrics()
+        
+        if not metrics:
+            return "No validation data available."
+        
+        report = f"""
+NMR-to-SMILES Validation Report
+===============================
+
+Overall Statistics:
+- Total molecules generated: {metrics['total_molecules']}
+- Valid SMILES: {metrics['valid_molecules']} ({metrics['validity_rate']:.2%})
+- Overall valid molecules: {metrics['overall_valid_rate']:.2%}
+- Reasonable properties: {metrics['reasonable_properties_rate']:.2%}
+
+H and C Atom Count Matching (NMR-specific):
+- Good H/C matches: {metrics['hc_match_rate']:.2%}
+- Perfect H/C matches: {metrics['perfect_hc_match_rate']:.2%}
+- Average H/C score: {metrics['avg_hc_score']:.3f}
+
+Error Analysis:
+- Average H error: {metrics['avg_h_error']:.3f} ({metrics['avg_h_error']*100:.1f}%)
+- Average C error: {metrics['avg_c_error']:.3f} ({metrics['avg_c_error']*100:.1f}%)
+- Median H error: {metrics['median_h_error']:.3f} ({metrics['median_h_error']*100:.1f}%)
+- Median C error: {metrics['median_c_error']:.3f} ({metrics['median_c_error']*100:.1f}%)
+
+Scoring:
+- Average property score: {metrics['avg_property_score']:.3f}
+- Average combined score: {metrics['avg_combined_score']:.3f}
+"""
+        
+        return report.strip()
+
+
+class EnhancedTrainingLoop:
+    """Enhanced training loop with validity-aware metrics and logging"""
+    
+    def __init__(self, model: EnhancedNMRToSMILES, optimizer, scheduler=None, 
+                 device='cuda', log_interval=100):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.log_interval = log_interval
+        
+        # Initialize metrics tracker
+        if isinstance(model.validator, EnhancedMoleculeValidator):
+            self.metrics = ValidationMetrics(model.validator)
+        else:
+            self.metrics = None
+        
+        # Training history
+        self.training_history = {
+            'losses': [],
+            'validity_rates': [],
+            'hc_match_rates': [],
+            'epochs': []
+        }
+    
+    def train_epoch(self, dataloader, epoch):
+        """Train for one epoch with enhanced metrics"""
+        self.model.train()
+        total_loss = 0
+        batch_count = 0
+        
+        if self.metrics:
+            self.metrics.reset()
+        
+        for batch_idx, batch in enumerate(dataloader):
+            # Move batch to device
+            nmr_features = batch['nmr_features'].to(self.device)
+            target_smiles = batch['smiles_tokens'].to(self.device)
+            nmr_data = batch.get('nmr_data', None)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            
+            outputs = self.model(nmr_features, target_smiles, nmr_data)
+            
+            # Extract loss
+            if isinstance(outputs, dict):
+                loss = outputs['loss']
+                loss_info = outputs.get('loss_info', {})
+            else:
+                loss = outputs  # Backward compatibility
+                loss_info = {}
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update metrics
+            total_loss += loss.item()
+            batch_count += 1
+            
+            # Validation metrics (periodically)
+            if self.metrics and batch_idx % self.log_interval == 0:
+                with torch.no_grad():
+                    # Generate samples for validation
+                    sample_size = min(8, nmr_features.size(0))
+                    sample_nmr = nmr_features[:sample_size]
+                    sample_data = {}
+                    
+                    if nmr_data:
+                        for key, values in nmr_data.items():
+                            sample_data[key] = values[:sample_size]
+                    
+                    generated = self.model.generate_batch(sample_nmr, sample_data)
+                    self.metrics.update(generated, sample_data)
+            
+            # Logging
+            if batch_idx % self.log_interval == 0:
+                avg_loss = total_loss / batch_count
+                
+                log_msg = f'Epoch {epoch}, Batch {batch_idx}: Loss {avg_loss:.4f}'
+                
+                if loss_info:
+                    for key, value in loss_info.items():
+                        if isinstance(value, (int, float)):
+                            log_msg += f', {key}: {value:.4f}'
+                
+                if self.metrics:
+                    metrics = self.metrics.get_metrics()
+                    if metrics:
+                        log_msg += f', Valid: {metrics.get("validity_rate", 0):.2%}'
+                        log_msg += f', HC Match: {metrics.get("hc_match_rate", 0):.2%}'
+                
+                logger.info(log_msg)
+        
+        # Update scheduler
+        if self.scheduler:
+            self.scheduler.step()
+        
+        # Record epoch metrics
+        avg_epoch_loss = total_loss / batch_count
+        self.training_history['losses'].append(avg_epoch_loss)
+        self.training_history['epochs'].append(epoch)
+        
+        if self.metrics:
+            final_metrics = self.metrics.get_metrics()
+            self.training_history['validity_rates'].append(
+                final_metrics.get('validity_rate', 0)
+            )
+            self.training_history['hc_match_rates'].append(
+                final_metrics.get('hc_match_rate', 0)
+            )
+        
+        return avg_epoch_loss
+    
+    def validate(self, dataloader):
+        """Comprehensive validation"""
+        self.model.eval()
+        
+        if not self.metrics:
+            logger.warning("No metrics tracker available for validation")
+            return {}
+        
+        self.metrics.reset()
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                nmr_features = batch['nmr_features'].to(self.device)
+                nmr_data = batch.get('nmr_data', {})
+                
+                # Generate SMILES
+                generated = self.model.generate_batch(nmr_features, nmr_data)
+                
+                # Update metrics
+                self.metrics.update(generated, nmr_data)
+        
+        return self.metrics.get_metrics()
+    
+    def get_training_summary(self):
+        """Get training summary with plots and metrics"""
+        summary = {
+            'training_history': self.training_history,
+            'final_metrics': self.metrics.get_metrics() if self.metrics else {},
+            'detailed_report': self.metrics.get_detailed_report() if self.metrics else ""
+        }
+        
+        return summary
+
+
+# Utility functions for integration and testing
+
+def create_enhanced_model(base_model, hc_count_tolerance=0.1, 
+                         max_heavy_atoms=150, max_mol_weight=1500):
+    """
+    Create an enhanced NMR-to-SMILES model with validity constraints
+    
+    Args:
+        base_model: Base NMR-to-SMILES model
+        hc_count_tolerance: Tolerance for H and C atom count matching
+        max_heavy_atoms: Maximum number of heavy atoms
+        max_mol_weight: Maximum molecular weight
+    
+    Returns:
+        Enhanced model with validity constraints
+    """
+    validator = EnhancedMoleculeValidator(
+        max_heavy_atoms=max_heavy_atoms,
+        max_mol_weight=max_mol_weight,
+        hc_count_tolerance=hc_count_tolerance
     )
     
-    # Create constrained generator focused on H and C
-    generator = ConstrainedSMILESGenerator(model, tokenizer, validator)
+    return EnhancedNMRToSMILES(base_model, validator, constrained_decoding=True)
+
+
+def create_enhanced_loss(base_criterion, hc_count_tolerance=0.1,
+                        validity_weight=0.3, hc_count_weight=0.4, token_weight=0.3):
+    """
+    Create enhanced loss function with H and C atom count awareness
     
-    return validator, enhanced_loss, generator
-
-
-def create_validity_aware_trainer(model, tokenizer, device='cuda'):
-    """Create trainer with validity awareness - backward compatible version"""
+    Args:
+        base_criterion: Base loss function (e.g., CrossEntropyLoss)
+        hc_count_tolerance: Tolerance for H and C atom count matching
+        validity_weight: Weight for general validity
+        hc_count_weight: Weight for H and C atom count matching
+        token_weight: Weight for token-level accuracy
     
-    # Create validator
-    validator = MoleculeValidator()
+    Returns:
+        Enhanced loss function
+    """
+    validator = EnhancedMoleculeValidator(hc_count_tolerance=hc_count_tolerance)
     
-    # Wrap model with enhanced version
-    enhanced_model = EnhancedNMRToSMILES(model, validator)
+    return AtomCountAwareLoss(
+        base_criterion=base_criterion,
+        validator=validator,
+        validity_weight=validity_weight,
+        hc_count_weight=hc_count_weight,
+        token_weight=token_weight
+    )
+
+
+def test_validation_pipeline(smiles_list, expected_h_list, expected_c_list):
+    """
+    Test the validation pipeline with sample data
     
-    # Create validity-aware loss
-    base_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    validity_loss = ValidityAwareLoss(base_criterion, validity_weight=0.1)
+    Args:
+        smiles_list: List of SMILES strings to validate
+        expected_h_list: List of expected hydrogen counts
+        expected_c_list: List of expected carbon counts
     
-    return enhanced_model, validity_loss, validator
-
-
-def filter_valid_smiles(data_list, logger=None):
-    """Filter out invalid SMILES from training data"""
-    try:
-        from rdkit import Chem
-        
-        valid_data = []
-        invalid_count = 0
-        
-        for data in data_list:
-            smiles = data.get('canonical_smiles', '')
-            try:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is not None:
-                    # Additional check - ensure it can be converted back
-                    canonical_smiles = Chem.MolToSmiles(mol)
-                    if canonical_smiles:
-                        data['canonical_smiles'] = canonical_smiles  # Use canonical form
-                        valid_data.append(data)
-                    else:
-                        invalid_count += 1
-                else:
-                    invalid_count += 1
-            except:
-                invalid_count += 1
-        
-        if logger:
-            logger.info(f"Filtered dataset: {len(data_list)} -> {len(valid_data)} "
-                       f"({invalid_count} invalid SMILES removed)")
-        
-        return valid_data
-        
-    except ImportError:
-        if logger:
-            logger.warning("RDKit not available for SMILES filtering")
-        return data_list
-
-
-def filter_data_by_hc_counts(data_list, max_h=100, max_c=50, logger=None):
-    """Filter training data by reasonable H and C atom counts from NMR data"""
-    filtered_data = []
+    Returns:
+        Validation results and metrics
+    """
+    validator = EnhancedMoleculeValidator(hc_count_tolerance=0.1)
+    metrics = ValidationMetrics(validator)
     
-    for data in data_list:
-        h_count = data.get('h_atoms', 0)
-        c_count = data.get('c_atoms', 0)
-        
-        # Only filter by H and C counts since other atoms don't appear in NMR
-        if h_count <= max_h and c_count <= max_c and h_count > 0 and c_count > 0:
-            filtered_data.append(data)
+    # Create fake NMR data
+    nmr_data = {
+        'h_atoms': expected_h_list,
+        'c_atoms': expected_c_list
+    }
     
-    if logger:
-        logger.info(f"Filtered by H/C counts: {len(data_list)} -> {len(filtered_data)}")
-        logger.info("Note: Only H and C atoms filtered - other atoms (N, O, S, etc.) allowed as they don't appear in NMR")
+    # Update metrics
+    metrics.update(smiles_list, nmr_data)
     
-    return filtered_data
+    return {
+        'metrics': metrics.get_metrics(),
+        'detailed_report': metrics.get_detailed_report(),
+        'validation_details': metrics.validation_details
+    }
 
 
-def analyze_non_hc_atoms(data_list, logger=None):
-    """Analyze the presence of non-H/C atoms in the dataset"""
-    try:
-        from rdkit import Chem
-        from collections import defaultdict
-        
-        other_atoms_stats = defaultdict(int)
-        molecules_with_other_atoms = 0
-        total_molecules = 0
-        
-        for data in data_list:
-            smiles = data.get('canonical_smiles', '')
-            if not smiles:
-                continue
-                
-            total_molecules += 1
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                continue
-            
-            # Count non-H/C atoms
-            has_other_atoms = False
-            for atom in mol.GetAtoms():
-                symbol = atom.GetSymbol()
-                if symbol not in ['H', 'C']:
-                    other_atoms_stats[symbol] += 1
-                    has_other_atoms = True
-            
-            if has_other_atoms:
-                molecules_with_other_atoms += 1
-        
-        if logger:
-            logger.info(f"\nNon-H/C Atom Analysis:")
-            logger.info(f"  Total molecules analyzed: {total_molecules}")
-            logger.info(f"  Molecules with non-H/C atoms: {molecules_with_other_atoms} ({molecules_with_other_atoms/total_molecules*100:.1f}%)")
-            logger.info(f"  Common non-H/C atoms found:")
-            for atom, count in sorted(other_atoms_stats.items(), key=lambda x: x[1], reverse=True):
-                logger.info(f"    {atom}: {count} occurrences")
-            logger.info(f"  Note: These atoms don't appear in 1H/13C NMR but are chemically valid")
-        
-        return other_atoms_stats, molecules_with_other_atoms
-        
-    except ImportError:
-        if logger:
-            logger.warning("RDKit not available for non-H/C atom analysis")
-        return {}, 0
-
-
-# Backward compatibility functions
-def filter_data_by_atom_counts(data_list, max_h=100, max_c=50, logger=None):
-    """Backward compatibility wrapper - redirects to H/C specific function"""
-    return filter_data_by_hc_counts(data_list, max_h, max_c, logger)
-
-
-class ConstrainedDecoding:
-    """Implement constrained decoding to ensure valid molecules"""
-    
-    def __init__(self, tokenizer, validator):
-        self.tokenizer = tokenizer
-        self.validator = validator
-        self.forbidden_patterns = self._build_forbidden_patterns()
-    
-    def _build_forbidden_patterns(self):
-        """Build patterns that should never appear in valid SMILES"""
-        return [
-            # Invalid valence patterns
-            'CC(C)(C)(C)C',  # Carbon with 5 bonds
-            'O(O)(O)',       # Oxygen with 3 bonds
-            'N(N)(N)(N)',    # Nitrogen with 4 bonds (unless charged)
-            # Add more patterns as needed
-        ]
-    
-    def get_valid_next_tokens(self, partial_tokens, vocab_size):
-        """Get mask of valid next tokens given partial sequence"""
-        partial_smiles = self.tokenizer.decode(partial_tokens, skip_special_tokens=True)
-        
-        # Create mask (1 = valid, 0 = invalid)
-        mask = torch.ones(vocab_size)
-        
-        # Mask out tokens that would create invalid patterns
-        for token_id in range(vocab_size):
-            token_str = self.tokenizer.convert_ids_to_tokens([token_id])[0]
-            
-            # Check if adding this token would create invalid SMILES
-            test_smiles = partial_smiles + token_str
-            
-            # Quick checks
-            if test_smiles.count(')') > test_smiles.count('('):
-                mask[token_id] = 0
-            elif test_smiles.count(']') > test_smiles.count('['):
-                mask[token_id] = 0
-            
-        return mask
-
-
-# Compatibility aliases for backward compatibility
-MolValidityAwareLoss = ValidityAwareLoss  # Old name
-HCAtomCountAwareLoss = AtomCountAwareLoss  # Alternative name
-
-
+# Example usage and testing
 if __name__ == "__main__":
-    # Test the enhanced H/C-focused validation system
-    print("Enhanced H/C-Focused Validity System for NMR-to-SMILES")
-    print("=" * 60)
-    
-    # Example validation
-    validator = EnhancedMoleculeValidator()
-    
-    test_molecules = [
-        {'smiles': 'CCO', 'expected_h': 6, 'expected_c': 2, 'name': 'Ethanol'},
-        {'smiles': 'c1ccccc1', 'expected_h': 6, 'expected_c': 6, 'name': 'Benzene'},
-        {'smiles': 'CC(=O)N', 'expected_h': 5, 'expected_c': 2, 'name': 'Acetamide'},
-        {'smiles': 'CCCl', 'expected_h': 5, 'expected_c': 2, 'name': 'Chloroethane'},
+    # Example test cases
+    test_smiles = [
+        "CCO",           # Ethanol: C2H6O
+        "CC(=O)O",       # Acetic acid: C2H4O2  
+        "c1ccccc1",      # Benzene: C6H6
+        "CCN(CC)CC",     # Triethylamine: C6H15N
+        "invalid_smiles" # Invalid SMILES
     ]
     
-    print("\nTesting H/C validation on example molecules:")
-    print("-" * 50)
+    expected_h = [6, 4, 6, 15, 0]
+    expected_c = [2, 2, 6, 6, 0]
     
-    for mol in test_molecules:
-        result = validator.comprehensive_validation(
-            mol['smiles'], mol['expected_h'], mol['expected_c']
-        )
-        
-        print(f"\n{mol['name']} ({mol['smiles']}):")
-        print(f"  Expected: H={mol['expected_h']}, C={mol['expected_c']}")
-        print(f"  Valid: {result['overall_valid']}")
-        print(f"  H/C Match: {result['hc_count_match']}")
-        print(f"  Score: {result['scores']['combined_score']:.3f}")
-        
-        if 'hc_info' in result:
-            hc_info = result['hc_info']
-            print(f"  Actual: H={hc_info['actual_h']}, C={hc_info['actual_c']}")
-            if hc_info['other_atoms_present']:
-                print(f"  Other atoms: {hc_info['other_atom_count']} (allowed - not in NMR)")
+    # Test validation pipeline
+    results = test_validation_pipeline(test_smiles, expected_h, expected_c)
     
-    print(f"\nSystem focuses only on H and C atoms from NMR data!")
-    print(f"Other atoms (N, O, S, halogens) are allowed without penalty.")
+    print("Validation Results:")
+    print("==================")
+    print(results['detailed_report'])
+    
+    print("\nDetailed Metrics:")
+    for key, value in results['metrics'].items():
+        print(f"{key}: {value}")

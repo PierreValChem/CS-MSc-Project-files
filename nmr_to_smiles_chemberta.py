@@ -855,41 +855,30 @@ class NMRToSMILES(nn.Module):
                 raise ValueError("Tokenizer must be provided for generation mode")
             return self._generate(nmr_encoding, tokenizer)
 
-class EnhancedTrainer:
-    """Enhanced training logic with detailed metrics tracking"""
+class ComprehensiveTrainer:
+    """Trainer with comprehensive reward/penalty system for proper molecule generation"""
     
-    def __init__(self, model, tokenizer, metrics_tracker, device='cuda', use_validity=False):
+    def __init__(self, model, tokenizer, metrics_tracker, device='cuda', use_comprehensive_rewards=False):
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
         self.metrics_tracker = metrics_tracker
-
-        # Check if we should use validity constraints
-        if use_validity and VALIDITY_AVAILABLE:
-            logger.info("Using validity-aware loss function")
-            self.validator = MoleculeValidator()
-            base_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-            self.criterion = ValidityAwareLoss(base_criterion, validity_weight=0.2)
-            self.use_validity = True
+        
+        # Initialize comprehensive reward/penalty system
+        if use_comprehensive_rewards:
+            try:
+                from comprehensive_reward_system import create_comprehensive_system
+                self.validator, self.criterion = create_comprehensive_system(model, tokenizer, device)
+                self.use_comprehensive = True
+                logger.info("Using comprehensive reward/penalty system for proper molecule generation")
+                logger.info("Reward priorities: H/C matching > Validity > Structure > Basic syntax")
+            except ImportError:
+                logger.warning("Comprehensive reward system not available. Using standard loss.")
+                self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+                self.use_comprehensive = False
         else:
-            if use_validity and not VALIDITY_AVAILABLE:
-                logger.warning("Validity checking requested but module not available. Running without validity constraints.")
             self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-            self.use_validity = False
-            self.validator = None
-    
-    def calculate_accuracy(self, outputs, targets, mask=None):
-        """Calculate token-level accuracy"""
-        predictions = outputs.argmax(dim=-1)
-        
-        if mask is not None:
-            correct = (predictions == targets) & mask
-            accuracy = correct.sum().float() / mask.sum().float()
-        else:
-            correct = predictions == targets
-            accuracy = correct.float().mean()
-        
-        return accuracy.item() * 100
+            self.use_comprehensive = False
     
     def train_epoch(self, dataloader, optimizer, scheduler):
         self.model.train()
@@ -898,9 +887,21 @@ class EnhancedTrainer:
         exact_matches = 0
         total_samples = 0
         
-        # Track validity metrics if using validity
-        total_validity_rate = 0
-        validity_count = 0
+        # Comprehensive metrics tracking
+        comprehensive_metrics = {
+            'empty_predictions': 0,
+            'invalid_smiles': 0,
+            'invalid_brackets': 0,
+            'invalid_valency': 0,
+            'perfect_hc_matches': 0,
+            'good_hc_matches': 0,
+            'valid_molecules': 0,
+            'total_reward': 0,
+            'total_penalty': 0,
+            'avg_score': 0,
+            'synergy_bonuses': 0,
+            'token_accuracy_scores': []
+        }
         
         progress_bar = tqdm(dataloader, desc='Training')
         for batch in progress_bar:
@@ -910,39 +911,69 @@ class EnhancedTrainer:
             smiles_ids = batch['smiles_ids'].to(self.device)
             smiles_mask = batch['smiles_mask'].to(self.device)
             
+            # Get expected atom counts from global features
+            expected_h = global_features[:, 0].cpu().numpy()
+            expected_c = global_features[:, 1].cpu().numpy()
+            
             outputs = self.model(
                 h_features, c_features, global_features,
                 smiles_ids[:, :-1], smiles_mask[:, :-1]
             )
             
-            # Handle both regular loss and validity-aware loss
-            if self.use_validity and hasattr(self.criterion, 'forward'):
-                # Generate predictions for validity checking
+            # Generate predictions for comprehensive evaluation
+            predictions = None
+            nmr_data = None
+            
+            if self.use_comprehensive:
                 with torch.no_grad():
-                    # Pass tokenizer for generation
-                    generated = self.model(h_features, c_features, global_features, tokenizer=self.tokenizer)
+                    # Generate predictions for each sample
                     predictions = []
-                    for gen_ids in generated:
-                        pred_smiles = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    for i in range(len(h_features)):
+                        try:
+                            generated = self.model(
+                                h_features[i:i+1], 
+                                c_features[i:i+1], 
+                                global_features[i:i+1], 
+                                tokenizer=self.tokenizer
+                            )
+                            pred_smiles = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                        except Exception as e:
+                            pred_smiles = ""  # Handle generation errors
+                        
                         predictions.append(pred_smiles)
                 
-                # Get loss with validity components
+                # Prepare NMR data for comprehensive evaluation
+                nmr_data = {
+                    'h_atoms': expected_h,
+                    'c_atoms': expected_c
+                }
+            
+            # Calculate loss with comprehensive rewards/penalties
+            if self.use_comprehensive and predictions is not None:
                 loss_output = self.criterion(
                     outputs,
                     smiles_ids[:, 1:],
-                    predictions=predictions
+                    predictions=predictions,
+                    nmr_data=nmr_data
                 )
                 
-                # Handle tuple output from ValidityAwareLoss
                 if isinstance(loss_output, tuple):
                     loss, loss_components = loss_output
-                    if 'validity_rate' in loss_components:
-                        total_validity_rate += loss_components['validity_rate']
-                        validity_count += 1
+                    
+                    # Update comprehensive metrics
+                    batch_stats = loss_components.get('batch_stats', {})
+                    for key in comprehensive_metrics:
+                        if key in batch_stats:
+                            comprehensive_metrics[key] += batch_stats[key]
+                    
+                    # Track average scores and token accuracy
+                    comprehensive_metrics['avg_score'] += loss_components.get('molecule_reward_penalty_sum', 0)
+                    if 'avg_token_accuracy' in loss_components:
+                        comprehensive_metrics['token_accuracy_scores'].append(loss_components['avg_token_accuracy'])
                 else:
                     loss = loss_output
             else:
-                # Regular cross-entropy loss
+                # Standard loss
                 loss = self.criterion(
                     outputs.reshape(-1, outputs.size(-1)),
                     smiles_ids[:, 1:].reshape(-1)
@@ -957,17 +988,30 @@ class EnhancedTrainer:
             
             # Check for exact matches
             with torch.no_grad():
-                if not (self.use_validity and hasattr(self.criterion, 'forward')):
-                    # Only generate if we haven't already for validity
-                    generated = self.model(h_features, c_features, global_features, tokenizer=self.tokenizer)
+                if predictions is None:
+                    # Generate for exact match checking
+                    predictions = []
+                    for i in range(len(h_features)):
+                        try:
+                            generated = self.model(
+                                h_features[i:i+1], 
+                                c_features[i:i+1], 
+                                global_features[i:i+1], 
+                                tokenizer=self.tokenizer
+                            )
+                            pred_smiles = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                        except:
+                            pred_smiles = ""
+                        predictions.append(pred_smiles)
                 
-                for i in range(len(generated)):
-                    pred_smiles = self.tokenizer.decode(generated[i], skip_special_tokens=True)
+                for i, pred_smiles in enumerate(predictions):
                     true_smiles = self.tokenizer.decode(smiles_ids[i], skip_special_tokens=True)
                     if pred_smiles == true_smiles:
                         exact_matches += 1
-                total_samples += len(generated)
+                
+                total_samples += len(predictions)
             
+            # Optimization step
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -977,40 +1021,117 @@ class EnhancedTrainer:
             total_loss += loss.item()
             total_accuracy += accuracy
             
-            # Get current learning rate
+            # Update progress bar with comprehensive metrics including token accuracy
             current_lr = scheduler.get_last_lr()[0]
-            
-            # Update progress bar
             progress_dict = {
                 'loss': loss.item(),
                 'acc': f'{accuracy:.2f}%',
                 'lr': f'{current_lr:.2e}'
             }
             
-            # Add validity rate if available
-            if validity_count > 0:
-                avg_validity = (total_validity_rate / validity_count) * 100
-                progress_dict['valid'] = f'{avg_validity:.1f}%'
+            # Add comprehensive metrics if available
+            if self.use_comprehensive and total_samples > 0:
+                empty_rate = (comprehensive_metrics['empty_predictions'] / total_samples) * 100
+                valid_rate = (comprehensive_metrics['valid_molecules'] / total_samples) * 100
+                perfect_hc_rate = (comprehensive_metrics['perfect_hc_matches'] / total_samples) * 100
+                
+                # Get token accuracy from loss components if available
+                if isinstance(loss_output, tuple) and len(loss_output) > 1:
+                    loss_components = loss_output[1]
+                    token_acc = loss_components.get('avg_token_accuracy', 0)
+                    synergy_rate = loss_components.get('synergy_rate', 0)
+                    
+                    progress_dict.update({
+                        'empty': f'{empty_rate:.1f}%',
+                        'valid': f'{valid_rate:.1f}%',
+                        'H/C': f'{perfect_hc_rate:.1f}%',
+                        'tok_acc': f'{token_acc:.1f}%',
+                        'synergy': f'{synergy_rate:.1f}%'
+                    })
+                else:
+                    progress_dict.update({
+                        'empty': f'{empty_rate:.1f}%',
+                        'valid': f'{valid_rate:.1f}%',
+                        'H/C': f'{perfect_hc_rate:.1f}%'
+                    })
             
             progress_bar.set_postfix(progress_dict)
         
+        # Calculate final metrics
         avg_loss = total_loss / len(dataloader)
         avg_accuracy = total_accuracy / len(dataloader)
         exact_match_rate = (exact_matches / total_samples) * 100 if total_samples > 0 else 0
         
-        # Log validity rate if using validity
-        if self.use_validity and validity_count > 0:
-            avg_validity_rate = (total_validity_rate / validity_count) * 100
-            logger.info(f"  Training Validity Rate: {avg_validity_rate:.2f}%")
+        # Comprehensive metrics summary including token accuracy synergy
+        enhanced_metrics = {}
+        if self.use_comprehensive and total_samples > 0:
+            avg_token_accuracy = (sum(comprehensive_metrics['token_accuracy_scores']) / 
+                                len(comprehensive_metrics['token_accuracy_scores'])) if comprehensive_metrics['token_accuracy_scores'] else 0
+            
+            enhanced_metrics = {
+                'empty_prediction_rate': (comprehensive_metrics['empty_predictions'] / total_samples) * 100,
+                'invalid_smiles_rate': (comprehensive_metrics['invalid_smiles'] / total_samples) * 100,
+                'invalid_brackets_rate': (comprehensive_metrics['invalid_brackets'] / total_samples) * 100,
+                'invalid_valency_rate': (comprehensive_metrics['invalid_valency'] / total_samples) * 100,
+                'perfect_hc_match_rate': (comprehensive_metrics['perfect_hc_matches'] / total_samples) * 100,
+                'good_hc_match_rate': (comprehensive_metrics['good_hc_matches'] / total_samples) * 100,
+                'validity_rate': (comprehensive_metrics['valid_molecules'] / total_samples) * 100,
+                'avg_reward_score': comprehensive_metrics['avg_score'] / len(dataloader),
+                'avg_token_accuracy': avg_token_accuracy,
+                'synergy_bonus_rate': (comprehensive_metrics['synergy_bonuses'] / total_samples) * 100,
+                'token_accuracy_integration': True  # Flag to show token accuracy is integrated
+            }
+            
+            logger.info(f"  Comprehensive Training Metrics (All Rewards Integrated):")
+            logger.info(f"    Empty Predictions: {enhanced_metrics['empty_prediction_rate']:.1f}%")
+            logger.info(f"    Invalid SMILES: {enhanced_metrics['invalid_smiles_rate']:.1f}%")
+            logger.info(f"    Invalid Brackets: {enhanced_metrics['invalid_brackets_rate']:.1f}%")
+            logger.info(f"    Invalid Valency: {enhanced_metrics['invalid_valency_rate']:.1f}%")
+            logger.info(f"    Perfect H/C Match: {enhanced_metrics['perfect_hc_match_rate']:.1f}%")
+            logger.info(f"    Good H/C Match: {enhanced_metrics['good_hc_match_rate']:.1f}%")
+            logger.info(f"    Valid Molecules: {enhanced_metrics['validity_rate']:.1f}%")
+            logger.info(f"    Average Token Accuracy: {enhanced_metrics['avg_token_accuracy']:.1f}%")
+            logger.info(f"    Average Reward Score: {enhanced_metrics['avg_reward_score']:.2f}")
+            logger.info(f"    Token Accuracy: Integrated with synergy bonuses ✓")
         
-        return avg_loss, avg_accuracy, exact_match_rate
+        return avg_loss, avg_accuracy, exact_match_rate, enhanced_metrics
+    
+    def calculate_accuracy(self, outputs, targets, mask=None):
+        """Calculate token-level accuracy"""
+        predictions = outputs.argmax(dim=-1)
+        
+        if mask is not None:
+            correct = (predictions == targets) & mask
+            accuracy = correct.sum().float() / mask.sum().float()
+        else:
+            correct = predictions == targets
+            accuracy = correct.float().mean()
+        
+        return accuracy.item() * 100
     
     def evaluate(self, dataloader, return_predictions=True, calculate_roc=False, calculate_tanimoto=True):
-        """Enhanced evaluate function with Tanimoto similarity calculation"""
+        """Enhanced evaluate function with comprehensive metrics"""
         self.model.eval()
         total_loss = 0
         total_accuracy = 0
         predictions = []
+        
+        # Comprehensive metrics tracking
+        comprehensive_metrics = {
+            'empty_predictions': 0,
+            'invalid_smiles': 0,
+            'invalid_brackets': 0,
+            'invalid_valency': 0,
+            'perfect_hc_matches': 0,
+            'good_hc_matches': 0,
+            'valid_molecules': 0,
+            'total_samples': 0,
+            'total_reward': 0,
+            'total_penalty': 0,
+            'detailed_evaluations': [],
+            'token_accuracy_scores': [],
+            'synergy_bonuses': 0
+        }
         
         # For ROC curves
         all_probs = []
@@ -1018,9 +1139,15 @@ class EnhancedTrainer:
         all_predictions = []
         
         # For Tanimoto similarity
-        tanimoto_calculator = TanimotoCalculator() if calculate_tanimoto else None
-        generated_smiles_list = []
-        true_smiles_list = []
+        if calculate_tanimoto:
+            try:
+                from tanimoto_metrics import TanimotoCalculator
+                tanimoto_calculator = TanimotoCalculator()
+                generated_smiles_list = []
+                true_smiles_list = []
+            except ImportError:
+                logger.warning("TanimotoCalculator not available")
+                calculate_tanimoto = False
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc='Evaluating'):
@@ -1030,13 +1157,17 @@ class EnhancedTrainer:
                 smiles_ids = batch['smiles_ids'].to(self.device)
                 smiles_mask = batch['smiles_mask'].to(self.device)
                 
+                # Get expected atom counts
+                expected_h = global_features[:, 0].cpu().numpy()
+                expected_c = global_features[:, 1].cpu().numpy()
+                
                 outputs = self.model(
                     h_features, c_features, global_features,
                     smiles_ids[:, :-1], smiles_mask[:, :-1]
                 )
                 
-                # Handle validity loss during evaluation
-                if self.use_validity and hasattr(self.criterion, 'forward'):
+                # Calculate loss (simplified for evaluation)
+                if self.use_comprehensive:
                     if hasattr(self.criterion, 'base_criterion'):
                         loss = self.criterion.base_criterion(
                             outputs.reshape(-1, outputs.size(-1)),
@@ -1078,89 +1209,186 @@ class EnhancedTrainer:
                     all_targets.append(smiles_mask[:, 1:].cpu().numpy())
                     all_predictions.append(predictions_correct.cpu().numpy())
                 
-                # Generate predictions
-                if return_predictions or calculate_tanimoto:
-                    # Use forced valid generation if using validity constraints
-                    if self.use_validity:
-                        generated = []
-                        for i in range(len(batch['h_features'])):
-                            # Generate one at a time with forced validity
-                            h_feat = h_features[i:i+1]
-                            c_feat = c_features[i:i+1] 
-                            g_feat = global_features[i:i+1]
-                            
-                            # Encode features
-                            nmr_encoding = self.model.nmr_encoder(h_feat, c_feat, g_feat).unsqueeze(0)
-                            
-                            # Generate with validity forcing, passing tokenizer
-                            gen_output = self.model._generate_valid_forced(
-                                nmr_encoding,
-                                self.tokenizer  # Pass the tokenizer here
-                            )
-                            generated.append(gen_output[0])
-                    else:
-                        # Normal generation - pass tokenizer
-                        generated = self.model(h_features, c_features, global_features, tokenizer=self.tokenizer)
+                # Generate predictions with comprehensive evaluation including token accuracy
+                if return_predictions or calculate_tanimoto or self.use_comprehensive:
+                    batch_predictions = []
                     
-                    for i, gen_ids in enumerate(generated):
-                        if isinstance(gen_ids, torch.Tensor):
-                            pred_smiles = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-                        else:
-                            pred_smiles = self.tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True)
+                    for i in range(len(h_features)):
+                        try:
+                            generated = self.model(
+                                h_features[i:i+1], 
+                                c_features[i:i+1], 
+                                global_features[i:i+1], 
+                                tokenizer=self.tokenizer
+                            )
+                            pred_smiles = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                        except:
+                            pred_smiles = ""
+                        
+                        batch_predictions.append(pred_smiles)
+                    
+                    # Process predictions with comprehensive evaluation including token accuracy
+                    for i, pred_smiles in enumerate(batch_predictions):
                         true_smiles = self.tokenizer.decode(smiles_ids[i], skip_special_tokens=True)
                         
                         if return_predictions:
-                            predictions.append({
+                            prediction_entry = {
                                 'id': batch['id'][i],
                                 'predicted': pred_smiles,
-                                'true': true_smiles
-                            })
+                                'true': true_smiles,
+                                'expected_h': int(expected_h[i]),
+                                'expected_c': int(expected_c[i])
+                            }
+                            
+                            # Add comprehensive evaluation if available
+                            if self.use_comprehensive:
+                                evaluation = self.validator.comprehensive_evaluation(
+                                    pred_smiles, int(expected_h[i]), int(expected_c[i])
+                                )
+                                
+                                # Calculate token accuracy for this sample
+                                sample_outputs = outputs[i]
+                                sample_targets = smiles_ids[i, 1:]  # Skip first token for targets
+                                predictions_tokens = sample_outputs.argmax(dim=-1)
+                                correct_tokens = (predictions_tokens == sample_targets).float()
+                                sample_token_accuracy = correct_tokens.mean().item()
+                                
+                                # Calculate synergy bonus
+                                if hasattr(self.criterion, '_calculate_synergy_bonus'):
+                                    synergy_bonus = self.criterion._calculate_synergy_bonus(evaluation, sample_token_accuracy)
+                                else:
+                                    synergy_bonus = 0.0
+                                
+                                # Add all evaluation details
+                                evaluation['token_accuracy'] = sample_token_accuracy
+                                evaluation['synergy_bonus'] = synergy_bonus
+                                evaluation['combined_score'] = evaluation['total_score'] + synergy_bonus
+                                
+                                prediction_entry['comprehensive_eval'] = evaluation
+                                prediction_entry['token_accuracy'] = sample_token_accuracy
+                                prediction_entry['synergy_bonus'] = synergy_bonus
+                                prediction_entry['combined_score'] = evaluation['combined_score']
+                                
+                                comprehensive_metrics['detailed_evaluations'].append(evaluation)
+                            
+                            predictions.append(prediction_entry)
                         
                         if calculate_tanimoto:
                             generated_smiles_list.append(pred_smiles)
                             true_smiles_list.append(true_smiles)
+                    
+                    # Update comprehensive metrics including token accuracy synergy
+                    if self.use_comprehensive:
+                        for i, (pred_smiles, exp_h, exp_c) in enumerate(zip(batch_predictions, expected_h, expected_c)):
+                            evaluation = self.validator.comprehensive_evaluation(pred_smiles, int(exp_h), int(exp_c))
+                            
+                            # Calculate token accuracy for this sample
+                            sample_outputs = outputs[i]
+                            sample_targets = smiles_ids[i, 1:]
+                            predictions_tokens = sample_outputs.argmax(dim=-1)
+                            correct_tokens = (predictions_tokens == sample_targets).float()
+                            sample_token_accuracy = correct_tokens.mean().item()
+                            
+                            # Calculate synergy bonus
+                            if hasattr(self.criterion, '_calculate_synergy_bonus'):
+                                synergy_bonus = self.criterion._calculate_synergy_bonus(evaluation, sample_token_accuracy)
+                                if synergy_bonus > 0:
+                                    comprehensive_metrics['synergy_bonuses'] += 1
+                            
+                            # Update standard metrics
+                            if 'empty_prediction' in evaluation['penalties']:
+                                comprehensive_metrics['empty_predictions'] += 1
+                            if 'invalid_smiles' in evaluation['penalties']:
+                                comprehensive_metrics['invalid_smiles'] += 1
+                            if 'invalid_brackets' in evaluation['penalties']:
+                                comprehensive_metrics['invalid_brackets'] += 1
+                            if 'invalid_valency' in evaluation['penalties']:
+                                comprehensive_metrics['invalid_valency'] += 1
+                            if 'perfect_hc_match' in evaluation['rewards']:
+                                comprehensive_metrics['perfect_hc_matches'] += 1
+                            elif 'good_hc_match' in evaluation['rewards']:
+                                comprehensive_metrics['good_hc_matches'] += 1
+                            if 'valid_molecule' in evaluation['rewards']:
+                                comprehensive_metrics['valid_molecules'] += 1
+                            
+                            comprehensive_metrics['total_reward'] += sum(evaluation['rewards'].values())
+                            comprehensive_metrics['total_penalty'] += sum(evaluation['penalties'].values())
+                            comprehensive_metrics['token_accuracy_scores'].append(sample_token_accuracy)
+                        
+                        comprehensive_metrics['total_samples'] += len(batch_predictions)
+        
+        # Calculate final metrics
+        avg_loss = total_loss / len(dataloader)
+        avg_accuracy = total_accuracy / len(dataloader)
+        
+        # Calculate exact match accuracy
+        exact_matches = sum(1 for p in predictions if p['predicted'] == p['true'])
+        exact_match_rate = (exact_matches / len(predictions)) * 100 if predictions else 0
+        
+        # Enhanced results
+        results = {
+            'loss': avg_loss,
+            'accuracy': avg_accuracy,
+            'exact_match_rate': exact_match_rate,
+            'predictions': predictions if return_predictions else None,
+        }
+        
+        # Add comprehensive metrics including token accuracy integration
+        if self.use_comprehensive and comprehensive_metrics['total_samples'] > 0:
+            total_samples = comprehensive_metrics['total_samples']
+            token_accuracy_scores = comprehensive_metrics.get('token_accuracy_scores', [])
+            avg_token_accuracy = sum(token_accuracy_scores) / len(token_accuracy_scores) if token_accuracy_scores else 0
+            synergy_bonuses = comprehensive_metrics.get('synergy_bonuses', 0)
             
-            avg_loss = total_loss / len(dataloader)
-            avg_accuracy = total_accuracy / len(dataloader)
-            
-            # Calculate exact match accuracy
-            exact_matches = sum(1 for p in predictions if p['predicted'] == p['true'])
-            exact_match_rate = (exact_matches / len(predictions)) * 100 if predictions else 0
-            
-            # ADD THIS BLOCK: Calculate validity rate if validator is available
-            validity_rate = 0.0
-            if hasattr(self, 'use_validity') and self.use_validity and self.validator and predictions:
-                valid_count = sum(1 for p in predictions 
-                                if self.validator.is_valid_smiles(p['predicted']))
-                validity_rate = (valid_count / len(predictions)) * 100
-                logger.info(f"Validity Rate: {validity_rate:.2f}%")  # Log it
-            
-            results = {
-                'loss': avg_loss,
-                'accuracy': avg_accuracy,
-                'exact_match_rate': exact_match_rate,
-                'predictions': predictions if return_predictions else None,
-                'validity_rate': validity_rate  # ADD THIS
+            enhanced_metrics = {
+                'empty_prediction_rate': (comprehensive_metrics['empty_predictions'] / total_samples) * 100,
+                'invalid_smiles_rate': (comprehensive_metrics['invalid_smiles'] / total_samples) * 100,
+                'invalid_brackets_rate': (comprehensive_metrics['invalid_brackets'] / total_samples) * 100,
+                'invalid_valency_rate': (comprehensive_metrics['invalid_valency'] / total_samples) * 100,
+                'perfect_hc_match_rate': (comprehensive_metrics['perfect_hc_matches'] / total_samples) * 100,
+                'good_hc_match_rate': (comprehensive_metrics['good_hc_matches'] / total_samples) * 100,
+                'validity_rate': (comprehensive_metrics['valid_molecules'] / total_samples) * 100,
+                'avg_reward': comprehensive_metrics['total_reward'] / total_samples,
+                'avg_penalty': comprehensive_metrics['total_penalty'] / total_samples,
+                'avg_total_score': (comprehensive_metrics['total_reward'] + comprehensive_metrics['total_penalty']) / total_samples,
+                'avg_token_accuracy': avg_token_accuracy * 100,
+                'synergy_bonus_rate': (synergy_bonuses / total_samples) * 100,
+                'token_accuracy_integrated': True  # Flag showing integration
             }
             
-            # Calculate Tanimoto similarities
-            if calculate_tanimoto and generated_smiles_list:
+            results['comprehensive_metrics'] = enhanced_metrics
+            
+            logger.info(f"Comprehensive Evaluation Metrics (All Rewards Integrated):")
+            logger.info(f"  Empty Predictions: {enhanced_metrics['empty_prediction_rate']:.1f}%")
+            logger.info(f"  Invalid SMILES: {enhanced_metrics['invalid_smiles_rate']:.1f}%")
+            logger.info(f"  Invalid Brackets: {enhanced_metrics['invalid_brackets_rate']:.1f}%")
+            logger.info(f"  Invalid Valency: {enhanced_metrics['invalid_valency_rate']:.1f}%")
+            logger.info(f"  Perfect H/C Match: {enhanced_metrics['perfect_hc_match_rate']:.1f}%")
+            logger.info(f"  Good H/C Match: {enhanced_metrics['good_hc_match_rate']:.1f}%")
+            logger.info(f"  Valid Molecules: {enhanced_metrics['validity_rate']:.1f}%")
+            logger.info(f"  Average Token Accuracy: {enhanced_metrics['avg_token_accuracy']:.1f}%")
+            logger.info(f"  Synergy Bonus Rate: {enhanced_metrics['synergy_bonus_rate']:.1f}%")
+            logger.info(f"  Average Total Score: {enhanced_metrics['avg_total_score']:.2f}")
+            logger.info(f"  Token Accuracy Integration: ✓ Active with synergy bonuses")
+        
+        # Calculate Tanimoto similarities
+        if calculate_tanimoto and generated_smiles_list:
+            try:
                 tanimoto_stats = tanimoto_calculator.calculate_batch_similarities(
                     generated_smiles_list, true_smiles_list
                 )
                 results['tanimoto_stats'] = tanimoto_stats
                 
-                # Log summary
-                logger.info(f"Tanimoto Similarity - Mean: {tanimoto_stats['mean_tanimoto']:.4f}, "
-                        f"Valid pairs: {tanimoto_stats['valid_pairs']}/{tanimoto_stats['total_pairs']}, "
-                        f"Validity rate: {tanimoto_stats['validity_rate']:.2%}")
-            
-            if calculate_roc and all_probs:
-                results['probs'] = np.concatenate(all_probs, axis=0)
-                results['targets'] = np.concatenate(all_targets, axis=0)
-                results['predictions_binary'] = np.concatenate(all_predictions, axis=0)
-            
-            return results
+                logger.info(f"Tanimoto Similarity - Mean: {tanimoto_stats['mean_tanimoto']:.4f}")
+            except Exception as e:
+                logger.warning(f"Tanimoto calculation failed: {e}")
+        
+        if calculate_roc and all_probs:
+            results['probs'] = np.concatenate(all_probs, axis=0)
+            results['targets'] = np.concatenate(all_targets, axis=0)
+            results['predictions_binary'] = np.concatenate(all_predictions, axis=0)
+        
+        return results
 
 # Replace the data loading section in your main() function with this:
 
@@ -1288,7 +1516,7 @@ def main(model_config=None):
         logger.info("Filtering training data for valid SMILES...")
 
         try:
-            from validity_constraints import filter_valid_smiles
+            from validity_constrains_backup import filter_valid_smiles
 
             # Split before filtering so we can track effects on each set
             train_val_data, test_data = train_test_split(
@@ -1430,7 +1658,7 @@ def main(model_config=None):
     
     # Initialize trainer with metrics tracker
     use_validity = config.get('use_molecule_validation', False)
-    trainer = EnhancedTrainer(model, tokenizer, metrics_tracker, device=config['device'], use_validity=use_validity)
+    trainer = ComprehensiveTrainer(model, tokenizer, metrics_tracker, device=config['device'], use_comprehensive_rewards=config.get('use_comprehensive_rewards', False))
     
     # Setup optimization
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'])
