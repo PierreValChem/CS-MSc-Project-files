@@ -28,18 +28,18 @@ MODEL_CONFIG = {
     'validity_weight': 1.0,  # Increased from 0.5 for stronger enforcement
     'learning_rate': 1e-5,   # Lower learning rate for stability
     'batch_size': 8,         # Smaller batch size for better learning
-    'num_epochs': 100,       # More epochs
+    'num_epochs': 20,       # More epochs
     'temperature': 0.7,      # Lower temperature for more conservative generation
     
     # Additional parameters for better training
     'gradient_clip': 0.5,    # Stronger gradient clipping
     'dropout': 0.2,          # More dropout for regularization
     'warmup_ratio': 0.2,     # Longer warmup
-    'save_metrics_every': 10,
-    'calculate_roc_every': 20,
+    'save_metrics_every': 5,
+    'calculate_roc_every': 5,
     
     # Generation parameters
-    'max_generation_attempts': 10,  # Fewer attempts to speed up
+    'max_generation_attempts': 50,  # Fewer attempts to speed up
     'beam_size': 3,                 # Smaller beam size
 }
 

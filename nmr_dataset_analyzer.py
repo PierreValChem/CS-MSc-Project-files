@@ -1633,7 +1633,7 @@ All detailed visualizations can be found in the accompanying HTML report and ima
 
 def main():
     # Configuration
-    data_dir = 'C:\\Users\\pierr\\Desktop\\CS MSc Project files\\peaklist\\outputv6_clean'  # Update this path
+    data_dir = 'C:\\Users\\pierr\\Desktop\\CS MSc Project files\\peaklist\\complete_compounds_only'  # Update this path
     
     # Create visualizer and run analysis
     visualizer = NMRDatasetVisualizer(data_dir)

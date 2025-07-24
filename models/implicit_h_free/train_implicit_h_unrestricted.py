@@ -21,8 +21,8 @@ MODEL_CONFIG = {
     'model_name': 'implicit_h_unrestricted',
     'use_explicit_h': False,
     'use_molecule_validation': False,  # No validation
-    'data_dir': 'C:\\Users\\pierr\\Desktop\\CS MSc Project files\\peaklist\\fakesmall',
-    'rebuild_vocab': False,
+    'data_dir': 'C:\\Users\\pierr\\Desktop\\CS MSc Project files\\peaklist\\complete_compounds_only',
+    'rebuild_vocab': True,
 }
 
 if __name__ == "__main__":

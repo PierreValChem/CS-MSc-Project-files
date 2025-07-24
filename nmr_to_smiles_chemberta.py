@@ -1092,9 +1092,12 @@ class ComprehensiveTrainer:
             logger.info(f"    Valid Molecules: {enhanced_metrics['validity_rate']:.1f}%")
             logger.info(f"    Average Token Accuracy: {enhanced_metrics['avg_token_accuracy']:.1f}%")
             logger.info(f"    Average Reward Score: {enhanced_metrics['avg_reward_score']:.2f}")
-            logger.info(f"    Token Accuracy: Integrated with synergy bonuses ✓")
+            logger.info(f"    Token Accuracy: Integrated with synergy bonuses [Active]")
         
-        return avg_loss, avg_accuracy, exact_match_rate, enhanced_metrics
+        if self.use_comprehensive and enhanced_metrics:
+            return avg_loss, avg_accuracy, exact_match_rate, enhanced_metrics
+        else:
+            return avg_loss, avg_accuracy, exact_match_rate
     
     def calculate_accuracy(self, outputs, targets, mask=None):
         """Calculate token-level accuracy"""
@@ -1684,9 +1687,12 @@ def main(model_config=None):
         logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
         
         # Train
-        train_loss, train_accuracy, train_exact_match = trainer.train_epoch(
-            train_loader, optimizer, scheduler
-        )
+        train_result = trainer.train_epoch(train_loader, optimizer, scheduler)
+        if isinstance(train_result, tuple) and len(train_result) == 4:
+            train_loss, train_accuracy, train_exact_match, train_enhanced_metrics = train_result
+        else:
+            train_loss, train_accuracy, train_exact_match = train_result
+            train_enhanced_metrics = None
         logger.info(f"Train loss: {train_loss:.4f}, Token Acc: {train_accuracy:.2f}%, "
                    f"Exact Match: {train_exact_match:.2f}%")
         
