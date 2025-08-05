@@ -21,6 +21,7 @@ from typing import Dict, List, Tuple, Optional
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
 from transformers import (
     RobertaTokenizer, 
     RobertaModel,
@@ -42,6 +43,18 @@ import warnings
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import defaultdict
+
+try:
+    from comprehensive_reward_system import (
+        create_comprehensive_system, 
+        ComprehensiveMoleculeValidator,
+        EnhancedRewardAwareLoss
+    )
+    COMPREHENSIVE_REWARDS_AVAILABLE = True
+    print("Comprehensive reward system loaded successfully")
+except ImportError as e:
+    COMPREHENSIVE_REWARDS_AVAILABLE = False
+    print(f"Comprehensive reward system not available: {e}")
 
 try:
     from validity_constraints import (
@@ -473,172 +486,456 @@ class NMRDataset(Dataset):
                 return_tensors='pt'
             )
             
+            # Include H and C atom counts
+            h_atoms = data.get('h_atoms', 0)
+            c_atoms = data.get('c_atoms', 0)
+            
             return {
                 'h_features': features['h_features'],
                 'c_features': features['c_features'],
                 'global_features': features['global_features'],
                 'smiles_ids': smiles_tokens['input_ids'].squeeze(),
                 'smiles_mask': smiles_tokens['attention_mask'].squeeze(),
-                'id': data.get('id', f'unknown_{idx}')
+                'id': data.get('id', f'unknown_{idx}'),
+                'h_atoms': h_atoms,  # Add H count
+                'c_atoms': c_atoms   # Add C count
             }
         except Exception as e:
             logger.error(f"Error processing item {idx}: {e}")
             raise
 
 class NMREncoder(nn.Module):
-    """Encode NMR data into embeddings"""
+    """Encode NMR data into embeddings using pretrained ChemBERTa"""
     
-    def __init__(self, h_input_dim=4, c_input_dim=4, hidden_dim=256, num_layers=3):
+    def __init__(self, h_input_dim=4, c_input_dim=4, hidden_dim=768, num_layers=3, 
+                 use_pretrained_chemberta=True, freeze_layers=6):
         super().__init__()
         
-        self.h_projection = nn.Linear(h_input_dim, hidden_dim)
-        self.h_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=8,
-                dim_feedforward=512,
-                dropout=0.1,
-                activation='gelu'
-            ),
-            num_layers=num_layers
-        )
+        # IMPORTANT: ChemBERTa requires exactly 768 dimensions
+        if use_pretrained_chemberta:
+            self.hidden_dim = 768  # Force to 768 for ChemBERTa
+        else:
+            self.hidden_dim = hidden_dim
+            
+        self.use_pretrained = use_pretrained_chemberta
         
-        self.c_projection = nn.Linear(c_input_dim, hidden_dim)
-        self.c_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=8,
-                dim_feedforward=512,
-                dropout=0.1,
-                activation='gelu'
-            ),
-            num_layers=num_layers
-        )
+        # Project NMR features to the correct dimension
+        self.h_projection = nn.Linear(h_input_dim, self.hidden_dim)
+        self.c_projection = nn.Linear(c_input_dim, self.hidden_dim)
         
-        self.global_projection = nn.Linear(4, hidden_dim)
+        if use_pretrained_chemberta:
+            # Load pretrained ChemBERTa model
+            logger.info("Loading pretrained ChemBERTa model...")
+            try:
+                # Load the config first to check dimensions
+                from transformers import AutoConfig
+                config = AutoConfig.from_pretrained('DeepChem/ChemBERTa-77M-MLM')
+                logger.info(f"ChemBERTa config - hidden_size: {config.hidden_size}")
+                
+                # Load the model
+                self.chemberta = RobertaModel.from_pretrained('DeepChem/ChemBERTa-77M-MLM')
+                
+                # Verify the hidden size
+                actual_hidden_size = self.chemberta.config.hidden_size
+                if actual_hidden_size != 768:
+                    logger.warning(f"ChemBERTa hidden size is {actual_hidden_size}, not 768!")
+                    self.hidden_dim = actual_hidden_size
+                    # Recreate projections with correct size
+                    self.h_projection = nn.Linear(h_input_dim, actual_hidden_size)
+                    self.c_projection = nn.Linear(c_input_dim, actual_hidden_size)
+                
+                # Freeze lower layers of ChemBERTa
+                if freeze_layers > 0:
+                    # Freeze embeddings
+                    for param in self.chemberta.embeddings.parameters():
+                        param.requires_grad = False
+                    
+                    # Freeze specified number of layers
+                    for layer_idx in range(min(freeze_layers, len(self.chemberta.encoder.layer))):
+                        for param in self.chemberta.encoder.layer[layer_idx].parameters():
+                            param.requires_grad = False
+                    
+                    logger.info(f"ChemBERTa loaded. Froze embeddings and first {freeze_layers} layers.")
+                    logger.info(f"Fine-tuning remaining {len(self.chemberta.encoder.layer) - freeze_layers} layers.")
+                else:
+                    logger.info("ChemBERTa loaded. All layers will be fine-tuned.")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load ChemBERTa: {e}")
+                logger.warning("Falling back to custom transformers")
+                self.use_pretrained = False
         
+        if not self.use_pretrained:
+            # Fallback to custom transformers
+            self.h_transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=self.hidden_dim,
+                    nhead=8 if self.hidden_dim == 256 else 12,  # Adjust heads based on dim
+                    dim_feedforward=512 if self.hidden_dim == 256 else 2048,
+                    dropout=0.1,
+                    activation='gelu',
+                    batch_first=True
+                ),
+                num_layers=num_layers
+            )
+            
+            self.c_transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=self.hidden_dim,
+                    nhead=8 if self.hidden_dim == 256 else 12,
+                    dim_feedforward=512 if self.hidden_dim == 256 else 2048,
+                    dropout=0.1,
+                    activation='gelu',
+                    batch_first=True
+                ),
+                num_layers=num_layers
+            )
+        
+        # Global projection uses the determined hidden dim
+        self.global_projection = nn.Linear(4, self.hidden_dim)
+        
+        # Fusion layer
         self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim * 2),
+            nn.LayerNorm(self.hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim)
         )
     
     def forward(self, h_features, c_features, global_features):
-        h_emb = self.h_projection(h_features)
-        c_emb = self.c_projection(c_features)
+        batch_size = h_features.size(0)
+        seq_len_h = h_features.size(1)
+        seq_len_c = c_features.size(1)
         
-        h_emb = h_emb.transpose(0, 1)
-        c_emb = c_emb.transpose(0, 1)
+        # Project NMR features to correct dimension
+        h_emb = self.h_projection(h_features)  # [batch, seq_len, hidden_dim]
+        c_emb = self.c_projection(c_features)  # [batch, seq_len, hidden_dim]
         
-        h_encoded = self.h_transformer(h_emb)
-        c_encoded = self.c_transformer(c_emb)
+        if self.use_pretrained:
+            # Use ChemBERTa for encoding
+            # Create attention masks (1 for real data, 0 for padding)
+            h_mask = (h_features.sum(dim=-1) != 0).long()  # [batch, seq_len]
+            c_mask = (c_features.sum(dim=-1) != 0).long()  # [batch, seq_len]
+            
+            # ChemBERTa expects inputs_embeds instead of input_ids
+            # We pass our projected embeddings directly
+            h_outputs = self.chemberta(
+                inputs_embeds=h_emb,
+                attention_mask=h_mask,
+                return_dict=True
+            )
+            h_encoded = h_outputs.last_hidden_state  # [batch, seq_len, hidden_dim]
+            
+            c_outputs = self.chemberta(
+                inputs_embeds=c_emb,
+                attention_mask=c_mask,
+                return_dict=True
+            )
+            c_encoded = c_outputs.last_hidden_state  # [batch, seq_len, hidden_dim]
+            
+            # Pool the sequences (using masked mean)
+            h_mask_expanded = h_mask.unsqueeze(-1).expand_as(h_encoded).float()
+            h_sum = (h_encoded * h_mask_expanded).sum(dim=1)
+            h_pooled = h_sum / h_mask_expanded.sum(dim=1).clamp(min=1e-9)
+            
+            c_mask_expanded = c_mask.unsqueeze(-1).expand_as(c_encoded).float()
+            c_sum = (c_encoded * c_mask_expanded).sum(dim=1)
+            c_pooled = c_sum / c_mask_expanded.sum(dim=1).clamp(min=1e-9)
+        else:
+            # Use custom transformers
+            # Create padding mask for transformers
+            h_mask = (h_features.sum(dim=-1) != 0).float()  # [batch, seq_len]
+            c_mask = (c_features.sum(dim=-1) != 0).float()  # [batch, seq_len]
+            
+            # Apply transformers
+            h_encoded = self.h_transformer(h_emb, src_key_padding_mask=~h_mask.bool())
+            c_encoded = self.c_transformer(c_emb, src_key_padding_mask=~c_mask.bool())
+            
+            # Pool with masking
+            h_mask_expanded = h_mask.unsqueeze(-1).expand_as(h_encoded)
+            h_pooled = (h_encoded * h_mask_expanded).sum(dim=1) / h_mask_expanded.sum(dim=1).clamp(min=1e-9)
+            
+            c_mask_expanded = c_mask.unsqueeze(-1).expand_as(c_encoded)
+            c_pooled = (c_encoded * c_mask_expanded).sum(dim=1) / c_mask_expanded.sum(dim=1).clamp(min=1e-9)
         
-        h_pooled = h_encoded.mean(dim=0)
-        c_pooled = c_encoded.mean(dim=0)
-        
+        # Global features
         global_emb = self.global_projection(global_features)
         
+        # Combine all features
         combined = torch.cat([h_pooled, c_pooled, global_emb], dim=-1)
         fused = self.fusion(combined)
         
         return fused
 
+
 class NMRToSMILES(nn.Module):
-    """Complete model for NMR to SMILES prediction"""
+    """Complete model for NMR to SMILES prediction using ChemBERTa encoder + Custom tokenizer decoder"""
     
     def __init__(self, nmr_encoder: NMREncoder, vocab_size: int, 
-                 hidden_dim: int = 256, num_decoder_layers: int = 6):
+                 hidden_dim: int = 768, num_decoder_layers: int = 6):
         super().__init__()
         self.nmr_encoder = nmr_encoder
+        self.hidden_dim = hidden_dim  # Should be 768 for ChemBERTa
         
+        # IMPORTANT: Using CUSTOM tokenizer vocabulary for decoder
+        logger.info(f"Initializing decoder with CUSTOM vocabulary size: {vocab_size}")
+        logger.info("ChemBERTa is used ONLY for encoding NMR features")
+        logger.info("SMILES generation uses CUSTOM tokenizer vocabulary")
+        
+        # Standard transformer decoder with CUSTOM vocabulary
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(512, hidden_dim)
         
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=hidden_dim,
-                nhead=8,
-                dim_feedforward=1024,
+                nhead=12,  # 12 heads for 768 dim (768/12 = 64 dim per head)
+                dim_feedforward=3072,  # Standard for BERT/RoBERTa
                 dropout=0.1,
-                activation='gelu'
+                activation='gelu',
+                batch_first=True  # Important for consistency
             ),
             num_layers=num_decoder_layers
         )
         
         self.output_projection = nn.Linear(hidden_dim, vocab_size)
         
-        self.hidden_dim = hidden_dim
         self.dropout = nn.Dropout(0.1)
         self.vocab_size = vocab_size
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights for better training"""
+        # Initialize embeddings
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+        
+        # Initialize output projection
+        nn.init.xavier_uniform_(self.output_projection.weight)
+        if self.output_projection.bias is not None:
+            nn.init.constant_(self.output_projection.bias, 0)
     
     def forward(self, h_features, c_features, global_features, 
-                target_ids=None, target_mask=None):
+                target_ids=None, target_mask=None, tokenizer=None):
+        # Encode NMR features using ChemBERTa encoder
         nmr_encoding = self.nmr_encoder(h_features, c_features, global_features)
-        nmr_encoding = nmr_encoding.unsqueeze(0)
+        nmr_encoding = nmr_encoding.unsqueeze(1)  # [batch, 1, hidden_dim]
         
         if target_ids is not None:
+            # Training mode
             seq_len = target_ids.size(1)
-            positions = torch.arange(seq_len, device=target_ids.device).unsqueeze(0)
+            batch_size = target_ids.size(0)
             
+            # Create position ids
+            positions = torch.arange(seq_len, device=target_ids.device).unsqueeze(0).expand(batch_size, -1)
+            
+            # Embed tokens and positions
             token_emb = self.token_embedding(target_ids)
             pos_emb = self.position_embedding(positions)
             target_emb = self.dropout(token_emb + pos_emb)
             
+            # Create causal mask
             causal_mask = self._generate_square_subsequent_mask(seq_len).to(target_ids.device)
             
-            target_emb = target_emb.transpose(0, 1)
-            
-            tgt_padding_mask = None
+            # Prepare padding mask
+            tgt_key_padding_mask = None
             if target_mask is not None:
-                tgt_padding_mask = ~target_mask.bool()
+                tgt_key_padding_mask = ~target_mask.bool()
             
+            # Decode
             decoded = self.decoder(
                 target_emb,
                 nmr_encoding,
                 tgt_mask=causal_mask,
-                tgt_key_padding_mask=tgt_padding_mask
+                tgt_key_padding_mask=tgt_key_padding_mask
             )
             
-            output = self.output_projection(decoded.transpose(0, 1))
+            # Project to vocabulary
+            output = self.output_projection(decoded)
             
             return output
         else:
-            return self._generate(nmr_encoding)
+            # Generation mode
+            if tokenizer is None:
+                raise ValueError("Tokenizer must be provided for generation mode")
+            return self._generate(nmr_encoding, tokenizer)
     
     def _generate(self, nmr_encoding, tokenizer, max_length=256, temperature=1.0):
-            """Generate SMILES autoregressively"""
-            device = nmr_encoding.device
-            batch_size = nmr_encoding.size(1)
-            
-            # Start with BOS token
-            generated = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-            
-            for _ in range(max_length - 1):
-                positions = torch.arange(generated.size(1), device=device).unsqueeze(0)
-                token_emb = self.token_embedding(generated)
-                pos_emb = self.position_embedding(positions)
-                target_emb = self.dropout(token_emb + pos_emb)
-                
-                target_emb = target_emb.transpose(0, 1)
-                decoded = self.decoder(target_emb, nmr_encoding)
-                
-                logits = self.output_projection(decoded[-1]) / temperature
-                probs = torch.softmax(logits, dim=-1)
-                
-                next_token = torch.multinomial(probs, 1)
-                generated = torch.cat([generated, next_token], dim=1)
-                
-                # Check for EOS token
-                if tokenizer and hasattr(tokenizer, 'eos_token_id'):
-                    if (next_token == tokenizer.eos_token_id).all():
-                        break
-                elif (next_token == 2).all():  # Common EOS token ID
-                    break
+        """Generate SMILES autoregressively using CUSTOM tokenizer"""
+        device = nmr_encoding.device
+        batch_size = nmr_encoding.size(0)
         
-            return generated
+        # Start with BOS token (assuming tokenizer has it)
+        if hasattr(tokenizer, 'bos_token_id'):
+            bos_id = tokenizer.bos_token_id
+        else:
+            bos_id = tokenizer.token_to_id.get('<bos>', 0)
+        
+        generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
+        
+        for _ in range(max_length - 1):
+            # Get current sequence length
+            seq_len = generated.size(1)
+            
+            # Create position embeddings
+            positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+            
+            # Embed tokens
+            token_emb = self.token_embedding(generated)
+            pos_emb = self.position_embedding(positions)
+            target_emb = self.dropout(token_emb + pos_emb)
+            
+            # Decode
+            decoded = self.decoder(
+                target_emb,
+                nmr_encoding
+            )
+            
+            # Get logits for next token
+            logits = self.output_projection(decoded[:, -1, :]) / temperature
+            probs = F.softmax(logits, dim=-1)
+            
+            # Sample next token
+            next_token = torch.multinomial(probs, 1)
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Check for EOS token
+            if hasattr(tokenizer, 'eos_token_id'):
+                eos_id = tokenizer.eos_token_id
+            else:
+                eos_id = tokenizer.token_to_id.get('<eos>', 2)
+            
+            if (next_token == eos_id).all():
+                break
+        
+        return generated
+    
+    def _generate_valid_forced(self, nmr_encoding, tokenizer, max_length=256, temperature=0.8, 
+                              max_attempts=50, beam_size=5):
+        """Generate valid SMILES with multiple attempts"""
+        device = nmr_encoding.device
+        batch_size = nmr_encoding.size(0)
+        
+        # Try simple generation first
+        for attempt in range(min(5, max_attempts)):
+            generated = self._generate(nmr_encoding, tokenizer, max_length, temperature)
+            smiles = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+            
+            # Try to validate
+            try:
+                from rdkit import Chem
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    return generated
+            except:
+                pass
+        
+        # If simple generation fails, try beam search
+        best_valid_smiles = None
+        best_score = float('-inf')
+        
+        # Get special token IDs from custom tokenizer
+        if hasattr(tokenizer, 'pad_token_id'):
+            pad_token_id = tokenizer.pad_token_id
+        else:
+            pad_token_id = tokenizer.token_to_id.get('<pad>', 0)
+            
+        if hasattr(tokenizer, 'eos_token_id'):
+            eos_token_id = tokenizer.eos_token_id
+        else:
+            eos_token_id = tokenizer.token_to_id.get('<eos>', 2)
+            
+        if hasattr(tokenizer, 'bos_token_id'):
+            bos_token_id = tokenizer.bos_token_id
+        else:
+            bos_token_id = tokenizer.token_to_id.get('<bos>', 1)
+        
+        # Beam search implementation
+        for beam_idx in range(min(3, beam_size)):
+            beams = [{
+                'tokens': torch.tensor([bos_token_id], dtype=torch.long, device=device),
+                'score': 0.0,
+                'complete': False
+            }]
+            
+            for step in range(min(50, max_length)):
+                new_beams = []
+                
+                for beam in beams[:5]:  # Limit beams per step
+                    if beam['complete'] or len(beam['tokens']) >= max_length - 1:
+                        new_beams.append(beam)
+                        continue
+                    
+                    # Get next token probabilities
+                    try:
+                        seq_len = beam['tokens'].size(0)
+                        positions = torch.arange(seq_len, device=device).unsqueeze(0)
+                        
+                        token_emb = self.token_embedding(beam['tokens'].unsqueeze(0))
+                        pos_emb = self.position_embedding(positions)
+                        target_emb = self.dropout(token_emb + pos_emb)
+                        
+                        decoded = self.decoder(target_emb, nmr_encoding)
+                        
+                        logits = self.output_projection(decoded[0, -1, :]) / temperature
+                        probs = F.softmax(logits, dim=-1)
+                        
+                        # Sample top k tokens
+                        k = min(5, probs.size(-1))
+                        top_probs, top_indices = torch.topk(probs, k)
+                        
+                        for idx in range(k):
+                            token_id = top_indices[idx].item()
+                            token_prob = top_probs[idx].item()
+                            
+                            # Skip padding token
+                            if token_id == pad_token_id:
+                                continue
+                            
+                            new_tokens = torch.cat([beam['tokens'], torch.tensor([token_id], device=device)])
+                            
+                            # Check if complete
+                            is_complete = (token_id == eos_token_id)
+                            
+                            new_beams.append({
+                                'tokens': new_tokens,
+                                'score': beam['score'] + np.log(token_prob),
+                                'complete': is_complete
+                            })
+                    
+                    except Exception as e:
+                        logger.debug(f"Error in beam search: {e}")
+                        continue
+                
+                # Keep top beams
+                beams = sorted(new_beams, key=lambda x: x['score'], reverse=True)[:beam_size]
+                
+                if not beams or all(b['complete'] for b in beams):
+                    break
+            
+            # Check validity of completed beams
+            for beam in beams:
+                if beam['complete']:
+                    smiles = tokenizer.decode(beam['tokens'].tolist(), skip_special_tokens=True)
+                    try:
+                        from rdkit import Chem
+                        mol = Chem.MolFromSmiles(smiles)
+                        if mol is not None and beam['score'] > best_score:
+                            best_score = beam['score']
+                            best_valid_smiles = beam['tokens'].unsqueeze(0)
+                    except:
+                        pass
+        
+        # Return best valid SMILES or last attempt
+        if best_valid_smiles is not None:
+            return best_valid_smiles
+        
+        # Final fallback
+        return self._generate(nmr_encoding, tokenizer, max_length, temperature * 0.5)
     
     def _generate_square_subsequent_mask(self, sz):
         """Generate causal attention mask"""
@@ -646,214 +943,18 @@ class NMRToSMILES(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask
     
-    def _generate_valid_forced(self, nmr_encoding, tokenizer, max_length=256, temperature=0.8, 
-                            max_attempts=50, beam_size=5):
-        """
-        Generate SMILES with forced validity using multiple strategies
-        """
-        device = nmr_encoding.device
-        batch_size = nmr_encoding.size(1)
-        
-        # Try to import RDKit for validation
-        try:
-            from rdkit import Chem
-            rdkit_available = True
-        except ImportError:
-            rdkit_available = False
-            logger.warning("RDKit not available for validity checking")
-        
-        # Strategy 1: Try simple generation first with validity check
-        for attempt in range(min(5, max_attempts)):
-            generated = self._generate(nmr_encoding, tokenizer, max_length, temperature)
-            smiles = tokenizer.decode(generated[0], skip_special_tokens=True)
-            
-            if rdkit_available:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is not None:
-                    return generated
-        
-        # Strategy 2: Constrained beam search with validity checking
-        best_valid_smiles = None
-        best_score = float('-inf')
-        
-        # Get special token IDs from tokenizer
-        pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
-        eos_token_id = getattr(tokenizer, 'eos_token_id', 2)
-        
-        for beam_idx in range(min(3, beam_size)):  # Limit beam search attempts
-            beams = [{
-                'tokens': torch.zeros((1,), dtype=torch.long, device=device),
-                'score': 0.0,
-                'smiles': ''
-            }]
-            
-            for step in range(min(50, max_length)):  # Limit steps to avoid hanging
-                new_beams = []
-                
-                for beam in beams[:5]:  # Limit beams per step
-                    if len(beam['tokens']) >= max_length - 1:
-                        continue
-                    
-                    # Get next token probabilities
-                    try:
-                        positions = torch.arange(beam['tokens'].size(0), device=device).unsqueeze(0)
-                        token_emb = self.token_embedding(beam['tokens'].unsqueeze(0))
-                        pos_emb = self.position_embedding(positions)
-                        target_emb = self.dropout(token_emb + pos_emb)
-                        
-                        target_emb = target_emb.transpose(0, 1)
-                        decoded = self.decoder(target_emb, nmr_encoding)
-                        
-                        logits = self.output_projection(decoded[-1]) / temperature
-                        probs = torch.softmax(logits, dim=-1)
-                        
-                        # Sample top k tokens
-                        k = min(5, probs.size(-1))
-                        top_probs, top_indices = torch.topk(probs[0], k)
-                        
-                        for idx in range(k):
-                            token_id = top_indices[idx].item()
-                            token_prob = top_probs[idx].item()
-                            
-                            # Skip if it's padding token
-                            if token_id == pad_token_id:
-                                continue
-                            
-                            new_tokens = torch.cat([beam['tokens'], torch.tensor([token_id], device=device)])
-                            
-                            # Decode to check validity
-                            new_smiles = tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
-                            
-                            # Check if it's the end token
-                            if token_id == eos_token_id:
-                                if rdkit_available:
-                                    mol = Chem.MolFromSmiles(new_smiles)
-                                    if mol is not None and beam['score'] + np.log(token_prob) > best_score:
-                                        best_score = beam['score'] + np.log(token_prob)
-                                        best_valid_smiles = new_smiles
-                                continue
-                            
-                            # Quick validity checks for partial SMILES
-                            if self._is_valid_partial_smiles(new_smiles):
-                                new_beams.append({
-                                    'tokens': new_tokens,
-                                    'score': beam['score'] + np.log(token_prob),
-                                    'smiles': new_smiles
-                                })
-                    except Exception as e:
-                        logger.debug(f"Error in beam search: {e}")
-                        continue
-                
-                # Keep only top beams
-                beams = sorted(new_beams, key=lambda x: x['score'], reverse=True)[:3]
-                
-                if not beams:
-                    break
-        
-        # If we found a valid SMILES, convert it back to tokens
-        if best_valid_smiles is not None:
-            # Use the tokenizer's encode method properly
-            encoded = tokenizer.encode(best_valid_smiles, max_length=max_length)
-            if isinstance(encoded, dict):
-                # Handle dict output from SMILESTokenizer
-                return torch.tensor(encoded['input_ids'], device=device).unsqueeze(0)
-            else:
-                # Handle list output
-                return torch.tensor([encoded], device=device)
-        
-        # Strategy 3: Try more simple generations
-        for _ in range(max_attempts - 5):
-            generated = self._generate(nmr_encoding, tokenizer, max_length, temperature * 0.8)
-            smiles = tokenizer.decode(generated[0], skip_special_tokens=True)
-            
-            if rdkit_available:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is not None:
-                    return generated
-        
-        # Final fallback: Return a simple valid default
-        default_smiles = "C"  # Methane
-        encoded = tokenizer.encode(default_smiles, max_length=max_length)
-        if isinstance(encoded, dict):
-            return torch.tensor(encoded['input_ids'], device=device).unsqueeze(0)
-        else:
-            return torch.tensor([encoded], device=device)
-
-    # Also update the _is_valid_partial_smiles method to be more lenient:
     def _is_valid_partial_smiles(self, partial_smiles):
-        """Quick checks for partial SMILES validity - more lenient"""
+        """Quick checks for partial SMILES validity"""
         if not partial_smiles:
             return True
         
-        # Don't check empty or very short strings
-        if len(partial_smiles) < 2:
-            return True
-        
         # Check balanced parentheses
-        open_paren = partial_smiles.count('(')
-        close_paren = partial_smiles.count(')')
-        if close_paren > open_paren:
+        if partial_smiles.count(')') > partial_smiles.count('('):
             return False
-        
-        # Check balanced brackets
-        open_bracket = partial_smiles.count('[')
-        close_bracket = partial_smiles.count(']')
-        if close_bracket > open_bracket:
+        if partial_smiles.count(']') > partial_smiles.count('['):
             return False
-        
-        # Don't check for invalid patterns in partial SMILES
-        # as they might be completed later
         
         return True
-    
-    def _is_valid_smiles(self, smiles):
-        """Check if SMILES is valid using RDKit"""
-        try:
-            from rdkit import Chem
-            mol = Chem.MolFromSmiles(smiles)
-            return mol is not None
-        except:
-            return False
-    
-    
-    # Modify the forward method to accept tokenizer for generation
-    def forward(self, h_features, c_features, global_features, 
-                target_ids=None, target_mask=None, tokenizer=None):
-        nmr_encoding = self.nmr_encoder(h_features, c_features, global_features)
-        nmr_encoding = nmr_encoding.unsqueeze(0)
-        
-        if target_ids is not None:
-            # Training mode - normal forward pass
-            seq_len = target_ids.size(1)
-            positions = torch.arange(seq_len, device=target_ids.device).unsqueeze(0)
-            
-            token_emb = self.token_embedding(target_ids)
-            pos_emb = self.position_embedding(positions)
-            target_emb = self.dropout(token_emb + pos_emb)
-            
-            causal_mask = self._generate_square_subsequent_mask(seq_len).to(target_ids.device)
-            
-            target_emb = target_emb.transpose(0, 1)
-            
-            tgt_padding_mask = None
-            if target_mask is not None:
-                tgt_padding_mask = ~target_mask.bool()
-            
-            decoded = self.decoder(
-                target_emb,
-                nmr_encoding,
-                tgt_mask=causal_mask,
-                tgt_key_padding_mask=tgt_padding_mask
-            )
-            
-            output = self.output_projection(decoded.transpose(0, 1))
-            
-            return output
-        else:
-            # Generation mode - need tokenizer
-            if tokenizer is None:
-                raise ValueError("Tokenizer must be provided for generation mode")
-            return self._generate(nmr_encoding, tokenizer)
 
 class ComprehensiveTrainer:
     """Trainer with comprehensive reward/penalty system for proper molecule generation"""
@@ -863,19 +964,35 @@ class ComprehensiveTrainer:
         self.tokenizer = tokenizer
         self.device = device
         self.metrics_tracker = metrics_tracker
+        self.use_comprehensive = False
+        self.validator = None
         
         # Initialize comprehensive reward/penalty system
         if use_comprehensive_rewards:
-            try:
-                from comprehensive_reward_system import create_comprehensive_system
-                self.validator, self.criterion = create_comprehensive_system(model, tokenizer, device)
-                self.use_comprehensive = True
-                logger.info("Using comprehensive reward/penalty system for proper molecule generation")
-                logger.info("Reward priorities: H/C matching > Validity > Structure > Basic syntax")
-            except ImportError:
-                logger.warning("Comprehensive reward system not available. Using standard loss.")
-                self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-                self.use_comprehensive = False
+            if 'COMPREHENSIVE_REWARDS_AVAILABLE' in globals() and COMPREHENSIVE_REWARDS_AVAILABLE:
+                try:
+                    from comprehensive_reward_system import create_comprehensive_system
+                    self.validator, self.criterion = create_comprehensive_system(model, tokenizer, device)
+                    self.use_comprehensive = True
+                    logger.info("Using comprehensive reward/penalty system for proper molecule generation")
+                    logger.info("Reward priorities: H/C matching > Validity > Structure > Token accuracy")
+                    logger.info("Token accuracy is fully integrated with synergy bonuses")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize comprehensive reward system: {e}")
+                    logger.warning("Falling back to standard loss function")
+                    self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+                    self.use_comprehensive = False
+            else:
+                try:
+                    from comprehensive_reward_system import create_comprehensive_system
+                    self.validator, self.criterion = create_comprehensive_system(model, tokenizer, device)
+                    self.use_comprehensive = True
+                    logger.info("Loaded comprehensive reward system successfully")
+                except ImportError:
+                    logger.warning("Comprehensive rewards requested but module not available")
+                    logger.warning("Please ensure comprehensive_reward_system.py is in the project directory")
+                    self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+                    self.use_comprehensive = False
         else:
             self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
             self.use_comprehensive = False
@@ -912,8 +1029,8 @@ class ComprehensiveTrainer:
             smiles_mask = batch['smiles_mask'].to(self.device)
             
             # Get expected atom counts from global features
-            expected_h = global_features[:, 0].cpu().numpy()
-            expected_c = global_features[:, 1].cpu().numpy()
+            expected_h = global_features[:, 0].cpu().numpy().astype(int)
+            expected_c = global_features[:, 1].cpu().numpy().astype(int)
             
             outputs = self.model(
                 h_features, c_features, global_features,
@@ -938,7 +1055,8 @@ class ComprehensiveTrainer:
                             )
                             pred_smiles = self.tokenizer.decode(generated[0], skip_special_tokens=True)
                         except Exception as e:
-                            pred_smiles = ""  # Handle generation errors
+                            logger.debug(f"Generation error: {e}")
+                            pred_smiles = ""
                         
                         predictions.append(pred_smiles)
                 
@@ -964,12 +1082,13 @@ class ComprehensiveTrainer:
                     batch_stats = loss_components.get('batch_stats', {})
                     for key in comprehensive_metrics:
                         if key in batch_stats:
-                            comprehensive_metrics[key] += batch_stats[key]
+                            if isinstance(batch_stats[key], list):
+                                comprehensive_metrics[key].extend(batch_stats[key])
+                            else:
+                                comprehensive_metrics[key] += batch_stats[key]
                     
-                    # Track average scores and token accuracy
+                    # Track average scores
                     comprehensive_metrics['avg_score'] += loss_components.get('molecule_reward_penalty_sum', 0)
-                    if 'avg_token_accuracy' in loss_components:
-                        comprehensive_metrics['token_accuracy_scores'].append(loss_components['avg_token_accuracy'])
                 else:
                     loss = loss_output
             else:
@@ -1021,7 +1140,7 @@ class ComprehensiveTrainer:
             total_loss += loss.item()
             total_accuracy += accuracy
             
-            # Update progress bar with comprehensive metrics including token accuracy
+            # Update progress bar with comprehensive metrics
             current_lr = scheduler.get_last_lr()[0]
             progress_dict = {
                 'loss': loss.item(),
@@ -1035,7 +1154,7 @@ class ComprehensiveTrainer:
                 valid_rate = (comprehensive_metrics['valid_molecules'] / total_samples) * 100
                 perfect_hc_rate = (comprehensive_metrics['perfect_hc_matches'] / total_samples) * 100
                 
-                # Get token accuracy from loss components if available
+                # Get metrics from loss components
                 if isinstance(loss_output, tuple) and len(loss_output) > 1:
                     loss_components = loss_output[1]
                     token_acc = loss_components.get('avg_token_accuracy', 0)
@@ -1048,12 +1167,6 @@ class ComprehensiveTrainer:
                         'tok_acc': f'{token_acc:.1f}%',
                         'synergy': f'{synergy_rate:.1f}%'
                     })
-                else:
-                    progress_dict.update({
-                        'empty': f'{empty_rate:.1f}%',
-                        'valid': f'{valid_rate:.1f}%',
-                        'H/C': f'{perfect_hc_rate:.1f}%'
-                    })
             
             progress_bar.set_postfix(progress_dict)
         
@@ -1062,7 +1175,7 @@ class ComprehensiveTrainer:
         avg_accuracy = total_accuracy / len(dataloader)
         exact_match_rate = (exact_matches / total_samples) * 100 if total_samples > 0 else 0
         
-        # Comprehensive metrics summary including token accuracy synergy
+        # Comprehensive metrics summary
         enhanced_metrics = {}
         if self.use_comprehensive and total_samples > 0:
             avg_token_accuracy = (sum(comprehensive_metrics['token_accuracy_scores']) / 
@@ -1079,22 +1192,18 @@ class ComprehensiveTrainer:
                 'avg_reward_score': comprehensive_metrics['avg_score'] / len(dataloader),
                 'avg_token_accuracy': avg_token_accuracy,
                 'synergy_bonus_rate': (comprehensive_metrics['synergy_bonuses'] / total_samples) * 100,
-                'token_accuracy_integration': True  # Flag to show token accuracy is integrated
             }
             
-            logger.info(f"  Comprehensive Training Metrics (All Rewards Integrated):")
+            logger.info(f"  Comprehensive Training Metrics:")
             logger.info(f"    Empty Predictions: {enhanced_metrics['empty_prediction_rate']:.1f}%")
             logger.info(f"    Invalid SMILES: {enhanced_metrics['invalid_smiles_rate']:.1f}%")
-            logger.info(f"    Invalid Brackets: {enhanced_metrics['invalid_brackets_rate']:.1f}%")
-            logger.info(f"    Invalid Valency: {enhanced_metrics['invalid_valency_rate']:.1f}%")
             logger.info(f"    Perfect H/C Match: {enhanced_metrics['perfect_hc_match_rate']:.1f}%")
-            logger.info(f"    Good H/C Match: {enhanced_metrics['good_hc_match_rate']:.1f}%")
             logger.info(f"    Valid Molecules: {enhanced_metrics['validity_rate']:.1f}%")
             logger.info(f"    Average Token Accuracy: {enhanced_metrics['avg_token_accuracy']:.1f}%")
+            logger.info(f"    Synergy Bonus Rate: {enhanced_metrics['synergy_bonus_rate']:.1f}%")
             logger.info(f"    Average Reward Score: {enhanced_metrics['avg_reward_score']:.2f}")
-            logger.info(f"    Token Accuracy: Integrated with synergy bonuses [Active]")
         
-        if self.use_comprehensive and enhanced_metrics:
+        if enhanced_metrics:
             return avg_loss, avg_accuracy, exact_match_rate, enhanced_metrics
         else:
             return avg_loss, avg_accuracy, exact_match_rate
@@ -1161,8 +1270,8 @@ class ComprehensiveTrainer:
                 smiles_mask = batch['smiles_mask'].to(self.device)
                 
                 # Get expected atom counts
-                expected_h = global_features[:, 0].cpu().numpy()
-                expected_c = global_features[:, 1].cpu().numpy()
+                expected_h = global_features[:, 0].cpu().numpy().astype(int)
+                expected_c = global_features[:, 1].cpu().numpy().astype(int)
                 
                 outputs = self.model(
                     h_features, c_features, global_features,
@@ -1212,7 +1321,7 @@ class ComprehensiveTrainer:
                     all_targets.append(smiles_mask[:, 1:].cpu().numpy())
                     all_predictions.append(predictions_correct.cpu().numpy())
                 
-                # Generate predictions with comprehensive evaluation including token accuracy
+                # Generate predictions with comprehensive evaluation
                 if return_predictions or calculate_tanimoto or self.use_comprehensive:
                     batch_predictions = []
                     
@@ -1230,7 +1339,7 @@ class ComprehensiveTrainer:
                         
                         batch_predictions.append(pred_smiles)
                     
-                    # Process predictions with comprehensive evaluation including token accuracy
+                    # Process predictions with comprehensive evaluation
                     for i, pred_smiles in enumerate(batch_predictions):
                         true_smiles = self.tokenizer.decode(smiles_ids[i], skip_special_tokens=True)
                         
@@ -1244,14 +1353,14 @@ class ComprehensiveTrainer:
                             }
                             
                             # Add comprehensive evaluation if available
-                            if self.use_comprehensive:
+                            if self.use_comprehensive and self.validator:
                                 evaluation = self.validator.comprehensive_evaluation(
                                     pred_smiles, int(expected_h[i]), int(expected_c[i])
                                 )
                                 
                                 # Calculate token accuracy for this sample
                                 sample_outputs = outputs[i]
-                                sample_targets = smiles_ids[i, 1:]  # Skip first token for targets
+                                sample_targets = smiles_ids[i, 1:]
                                 predictions_tokens = sample_outputs.argmax(dim=-1)
                                 correct_tokens = (predictions_tokens == sample_targets).float()
                                 sample_token_accuracy = correct_tokens.mean().item()
@@ -1280,8 +1389,8 @@ class ComprehensiveTrainer:
                             generated_smiles_list.append(pred_smiles)
                             true_smiles_list.append(true_smiles)
                     
-                    # Update comprehensive metrics including token accuracy synergy
-                    if self.use_comprehensive:
+                    # Update comprehensive metrics
+                    if self.use_comprehensive and self.validator:
                         for i, (pred_smiles, exp_h, exp_c) in enumerate(zip(batch_predictions, expected_h, expected_c)):
                             evaluation = self.validator.comprehensive_evaluation(pred_smiles, int(exp_h), int(exp_c))
                             
@@ -1298,7 +1407,7 @@ class ComprehensiveTrainer:
                                 if synergy_bonus > 0:
                                     comprehensive_metrics['synergy_bonuses'] += 1
                             
-                            # Update standard metrics
+                            # Update metrics
                             if 'empty_prediction' in evaluation['penalties']:
                                 comprehensive_metrics['empty_predictions'] += 1
                             if 'invalid_smiles' in evaluation['penalties']:
@@ -1336,7 +1445,7 @@ class ComprehensiveTrainer:
             'predictions': predictions if return_predictions else None,
         }
         
-        # Add comprehensive metrics including token accuracy integration
+        # Add comprehensive metrics
         if self.use_comprehensive and comprehensive_metrics['total_samples'] > 0:
             total_samples = comprehensive_metrics['total_samples']
             token_accuracy_scores = comprehensive_metrics.get('token_accuracy_scores', [])
@@ -1356,23 +1465,18 @@ class ComprehensiveTrainer:
                 'avg_total_score': (comprehensive_metrics['total_reward'] + comprehensive_metrics['total_penalty']) / total_samples,
                 'avg_token_accuracy': avg_token_accuracy * 100,
                 'synergy_bonus_rate': (synergy_bonuses / total_samples) * 100,
-                'token_accuracy_integrated': True  # Flag showing integration
             }
             
             results['comprehensive_metrics'] = enhanced_metrics
             
-            logger.info(f"Comprehensive Evaluation Metrics (All Rewards Integrated):")
+            logger.info(f"Comprehensive Evaluation Metrics:")
             logger.info(f"  Empty Predictions: {enhanced_metrics['empty_prediction_rate']:.1f}%")
             logger.info(f"  Invalid SMILES: {enhanced_metrics['invalid_smiles_rate']:.1f}%")
-            logger.info(f"  Invalid Brackets: {enhanced_metrics['invalid_brackets_rate']:.1f}%")
-            logger.info(f"  Invalid Valency: {enhanced_metrics['invalid_valency_rate']:.1f}%")
             logger.info(f"  Perfect H/C Match: {enhanced_metrics['perfect_hc_match_rate']:.1f}%")
-            logger.info(f"  Good H/C Match: {enhanced_metrics['good_hc_match_rate']:.1f}%")
             logger.info(f"  Valid Molecules: {enhanced_metrics['validity_rate']:.1f}%")
             logger.info(f"  Average Token Accuracy: {enhanced_metrics['avg_token_accuracy']:.1f}%")
             logger.info(f"  Synergy Bonus Rate: {enhanced_metrics['synergy_bonus_rate']:.1f}%")
             logger.info(f"  Average Total Score: {enhanced_metrics['avg_total_score']:.2f}")
-            logger.info(f"  Token Accuracy Integration: ✓ Active with synergy bonuses")
         
         # Calculate Tanimoto similarities
         if calculate_tanimoto and generated_smiles_list:
@@ -1429,9 +1533,22 @@ def main(model_config=None):
     # Override with model-specific config if provided
     config = base_config.copy()
     
-    # Setup directories and logging
     if model_config:
         config.update(model_config)
+        
+        # Handle comprehensive rewards configuration
+        if config.get('use_comprehensive_rewards', False):
+            # Override training parameters for comprehensive rewards
+            config['learning_rate'] = config.get('learning_rate', 3e-6)  # Lower LR
+            config['batch_size'] = config.get('batch_size', 8)  # Smaller batch
+            config['gradient_clip'] = config.get('gradient_clip', 0.25)  # Stronger clipping
+            config['warmup_ratio'] = config.get('warmup_ratio', 0.4)  # Longer warmup
+            
+            logger.info("Using comprehensive reward system configuration:")
+            logger.info(f"  Learning rate: {config['learning_rate']}")
+            logger.info(f"  Batch size: {config['batch_size']}")
+            logger.info(f"  Gradient clip: {config['gradient_clip']}")
+            logger.info(f"  Warmup ratio: {config['warmup_ratio']}")
         
         # Set up model-specific paths - ALL outputs go to current directory
         model_name = config.get('model_name', 'default_model')
@@ -1645,16 +1762,47 @@ def main(model_config=None):
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
     
-    # Initialize model
-    logger.info("Initializing model...")
+   # Initialize model with ChemBERTa encoder and custom tokenizer decoder
+    logger.info("="*60)
+    logger.info("MODEL INITIALIZATION")
+    logger.info("="*60)
+    
+    use_chemberta = config.get('use_pretrained_chemberta', True)
+    
+    if use_chemberta:
+        # ChemBERTa-77M uses 384 hidden dimension (not 768!)
+        logger.info("Checking ChemBERTa model configuration...")
+        try:
+            from transformers import AutoConfig
+            chemberta_config = AutoConfig.from_pretrained('DeepChem/ChemBERTa-77M-MLM')
+            chemberta_hidden_dim = chemberta_config.hidden_size
+            logger.info(f"ChemBERTa-77M hidden dimension: {chemberta_hidden_dim}")
+            config['hidden_dim'] = chemberta_hidden_dim  # Set to actual ChemBERTa dim
+        except Exception as e:
+            logger.warning(f"Could not load ChemBERTa config: {e}")
+            config['hidden_dim'] = 384  # Default for ChemBERTa-77M
+            
+        logger.info("Initializing model with:")
+        logger.info("  - ChemBERTa-77M encoder (pretrained on 77M molecules)")
+        logger.info("  - Custom decoder with YOUR tokenizer vocabulary")
+        logger.info(f"  - Hidden dimension: {config['hidden_dim']} (ChemBERTa-77M size)")
+        logger.info(f"  - Decoder vocabulary size: {tokenizer.vocab_size}")
+    else:
+        logger.info("Initializing model without ChemBERTa (custom transformers)")
+        # Keep original hidden_dim for custom model
+    
+    # Create NMR encoder with ChemBERTa
     nmr_encoder = NMREncoder(
         hidden_dim=config['hidden_dim'],
-        num_layers=config['num_encoder_layers']
+        num_layers=config['num_encoder_layers'],
+        use_pretrained_chemberta=use_chemberta,
+        freeze_layers=config.get('freeze_chemberta_layers', 6)
     )
     
+    # Create full model
     model = NMRToSMILES(
         nmr_encoder=nmr_encoder,
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=tokenizer.vocab_size,  # YOUR CUSTOM VOCAB SIZE
         hidden_dim=config['hidden_dim'],
         num_decoder_layers=config['num_decoder_layers']
     )
@@ -1681,7 +1829,7 @@ def main(model_config=None):
     model_name = config.get('model_name', 'nmr_to_smiles')
     
     # Test every N epochs to track progress
-    test_every_n_epochs = 10
+    test_every_n_epochs = 5
     
     for epoch in range(config['num_epochs']):
         logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")

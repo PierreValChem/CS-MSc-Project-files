@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Comprehensive Reward/Penalty System for NMR-to-SMILES Training
-Focuses on rewarding proper molecule generation with correct H/C counts and valid chemistry
+Priority: Validity > Token Accuracy > Structure > H/C matching
 """
 
 import torch
@@ -17,32 +17,44 @@ import re
 logger = logging.getLogger(__name__)
 
 class ComprehensiveMoleculeValidator:
-    """Comprehensive validator with detailed rewards and penalties"""
+    """Comprehensive validator with validity as the highest priority"""
     
-    def __init__(self, hc_count_tolerance=0.05):
+    def __init__(self, hc_count_tolerance=0.1):
         """
         Args:
-            hc_count_tolerance: Very strict tolerance for H/C counts (5% default)
+            hc_count_tolerance: More lenient tolerance for H/C counts (10% default)
         """
         self.hc_count_tolerance = hc_count_tolerance
         
-        # Define reward/penalty weights (higher = more important)
+        # REVISED WEIGHTS: Validity > Token Accuracy > Structure > H/C
         self.weights = {
-            'empty_prediction': -10.0,      # Severe penalty for empty predictions
-            'invalid_smiles': -8.0,         # Severe penalty for invalid SMILES
-            'invalid_brackets': -6.0,       # High penalty for bracket/parentheses issues
-            'invalid_valency': -7.0,        # High penalty for valency violations
-            'perfect_hc_match': 10.0,       # High reward for perfect H/C match
-            'good_hc_match': 5.0,           # Good reward for close H/C match
-            'poor_hc_match': -4.0,          # Penalty for poor H/C match
-            'valid_molecule': 3.0,          # Reward for basic validity
-            'reasonable_structure': 2.0,    # Reward for reasonable molecular properties
-            'minimal_length': 1.0,          # Small reward for non-empty predictions
+            # PENALTIES (balanced approach)
+            'empty_prediction': -5.0,      # Moderate penalty
+            'invalid_smiles': -3.0,        # Reduced to encourage attempts
+            'invalid_brackets': -2.0,      # Syntax error
+            'invalid_valency': -2.5,       # Chemistry error
+            'poor_hc_match': -0.2,         # Very gentle for H/C mismatch
+            
+            # REWARDS (prioritizing validity)
+            'valid_molecule': 15.0,        # HIGHEST - Valid SMILES is crucial
+            'valid_syntax': 10.0,          # HIGH - Correct syntax
+            'reasonable_structure': 8.0,   # MEDIUM - Good structure
+            'minimal_length': 5.0,         # Basic reward
+            
+            # H/C matching (lower priority)
+            'perfect_hc_match': 5.0,       # Reduced from 20.0
+            'good_hc_match': 3.0,          # Reduced from 12.0
+            'partial_hc_match': 1.5,       # Reduced from 6.0
+            
+            # Additional rewards
+            'valid_brackets': 3.0,         # Syntax correctness
+            'reasonable_length': 2.0,      # Appropriate size
+            'contains_carbon': 1.0,        # Basic chemistry
         }
     
     def comprehensive_evaluation(self, predicted_smiles: str, expected_h: int, expected_c: int) -> Dict[str, Any]:
         """
-        Comprehensive evaluation with detailed rewards and penalties
+        Comprehensive evaluation with validity as top priority
         
         Returns:
             Dictionary with scores, penalties, rewards, and detailed analysis
@@ -59,23 +71,27 @@ class ComprehensiveMoleculeValidator:
             'successes': []
         }
         
-        # 1. Check for empty prediction (most critical)
+        # 1. Check for empty prediction
         if not predicted_smiles or predicted_smiles.strip() == "":
             evaluation['penalties']['empty_prediction'] = self.weights['empty_prediction']
             evaluation['issues'].append("Empty prediction")
             evaluation['total_score'] = self.weights['empty_prediction']
             return evaluation
         
-        # 2. Check bracket/parentheses validity (before RDKit parsing)
+        # Small reward for attempting
+        evaluation['rewards']['minimal_length'] = self.weights['minimal_length']
+        evaluation['successes'].append("Generated non-empty SMILES")
+        
+        # 2. Check bracket/parentheses validity
         bracket_score, bracket_issues = self._check_bracket_validity(predicted_smiles)
         if bracket_score < 0:
             evaluation['penalties']['invalid_brackets'] = bracket_score
             evaluation['issues'].extend(bracket_issues)
         else:
-            evaluation['rewards']['valid_brackets'] = bracket_score
+            evaluation['rewards']['valid_brackets'] = self.weights['valid_brackets']
             evaluation['successes'].append("Valid brackets/parentheses")
         
-        # 3. Basic SMILES validity check
+        # 3. Basic SMILES validity check (HIGHEST PRIORITY)
         mol = None
         try:
             mol = Chem.MolFromSmiles(predicted_smiles)
@@ -85,14 +101,22 @@ class ComprehensiveMoleculeValidator:
         if mol is None:
             evaluation['penalties']['invalid_smiles'] = self.weights['invalid_smiles']
             evaluation['issues'].append("Invalid SMILES - cannot parse")
+            
+            # Still give small reward for containing carbon
+            if 'C' in predicted_smiles or 'c' in predicted_smiles:
+                evaluation['rewards']['contains_carbon'] = self.weights['contains_carbon']
+                evaluation['successes'].append("Contains carbon atoms")
+            
             evaluation['total_score'] = sum(evaluation['penalties'].values()) + sum(evaluation['rewards'].values())
             return evaluation
         
-        # 4. Reward basic validity
+        # 4. MAJOR REWARDS for validity
         evaluation['rewards']['valid_molecule'] = self.weights['valid_molecule']
-        evaluation['successes'].append("Valid SMILES structure")
+        evaluation['rewards']['valid_syntax'] = self.weights['valid_syntax']
+        evaluation['successes'].append("VALID SMILES - Highest priority achieved!")
+        evaluation['successes'].append("Correct chemical syntax")
         
-        # 5. Check valency (critical for chemical validity)
+        # 5. Check valency
         valency_score, valency_issues = self._check_valency(mol)
         if valency_score < 0:
             evaluation['penalties']['invalid_valency'] = valency_score
@@ -101,30 +125,35 @@ class ComprehensiveMoleculeValidator:
             evaluation['rewards']['valid_valency'] = valency_score
             evaluation['successes'].append("Valid atomic valencies")
         
-        # 6. H and C atom count analysis (most important for NMR)
+        # 6. Structural reasonableness (MEDIUM PRIORITY)
+        structure_score = self._evaluate_structure_reasonableness(mol)
+        if structure_score > 0:
+            evaluation['rewards']['reasonable_structure'] = self.weights['reasonable_structure']
+            evaluation['successes'].append("Reasonable molecular structure")
+        
+        # 7. Reasonable length reward
+        mol_size = mol.GetNumHeavyAtoms()
+        if 3 <= mol_size <= 50:  # Wider range for flexibility
+            evaluation['rewards']['reasonable_length'] = self.weights['reasonable_length']
+            evaluation['successes'].append("Reasonable molecule size")
+        
+        # 8. H and C atom count analysis (LOWEST PRIORITY - gentle scoring)
         hc_score, hc_details = self._evaluate_hc_counts(mol, expected_h, expected_c)
         evaluation['scores']['hc_match_score'] = hc_score
         evaluation['hc_details'] = hc_details
         
-        if hc_score >= 8:  # Perfect or near-perfect match
+        if hc_score >= 9:  # Perfect or near-perfect match
             evaluation['rewards']['perfect_hc_match'] = self.weights['perfect_hc_match']
-            evaluation['successes'].append(f"Excellent H/C match: H={hc_details['actual_h']}/{expected_h}, C={hc_details['actual_c']}/{expected_c}")
-        elif hc_score >= 4:  # Good match
+            evaluation['successes'].append(f"Perfect H/C match: H={hc_details['actual_h']}/{expected_h}, C={hc_details['actual_c']}/{expected_c}")
+        elif hc_score >= 7:  # Good match
             evaluation['rewards']['good_hc_match'] = self.weights['good_hc_match']
             evaluation['successes'].append(f"Good H/C match: H={hc_details['actual_h']}/{expected_h}, C={hc_details['actual_c']}/{expected_c}")
-        else:  # Poor match
+        elif hc_score >= 5:  # Partial match
+            evaluation['rewards']['partial_hc_match'] = self.weights['partial_hc_match']
+            evaluation['successes'].append(f"Partial H/C match: H={hc_details['actual_h']}/{expected_h}, C={hc_details['actual_c']}/{expected_c}")
+        else:  # Poor match - very gentle penalty
             evaluation['penalties']['poor_hc_match'] = self.weights['poor_hc_match']
-            evaluation['issues'].append(f"Poor H/C match: H={hc_details['actual_h']}/{expected_h}, C={hc_details['actual_c']}/{expected_c}")
-        
-        # 7. Structural reasonableness
-        structure_score = self._evaluate_structure_reasonableness(mol)
-        if structure_score > 0:
-            evaluation['rewards']['reasonable_structure'] = structure_score
-            evaluation['successes'].append("Reasonable molecular structure")
-        
-        # 8. Minimal length reward (small incentive for non-empty predictions)
-        if len(predicted_smiles) >= 2:
-            evaluation['rewards']['minimal_length'] = self.weights['minimal_length']
+            evaluation['issues'].append(f"H/C mismatch (low priority): H={hc_details['actual_h']}/{expected_h}, C={hc_details['actual_c']}/{expected_c}")
         
         # Calculate total score
         total_penalties = sum(evaluation['penalties'].values())
@@ -136,7 +165,6 @@ class ComprehensiveMoleculeValidator:
     def _check_bracket_validity(self, smiles: str) -> Tuple[float, List[str]]:
         """Check if brackets and parentheses are properly balanced"""
         issues = []
-        score = 0.0
         
         # Check parentheses
         paren_count = 0
@@ -211,7 +239,7 @@ class ComprehensiveMoleculeValidator:
             return self.weights['invalid_valency'], issues
     
     def _evaluate_hc_counts(self, mol, expected_h: int, expected_c: int) -> Tuple[float, Dict]:
-        """Evaluate H and C atom counts with detailed scoring"""
+        """Evaluate H and C atom counts with more lenient scoring (lowest priority)"""
         # Count atoms
         c_count = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == 'C')
         
@@ -230,21 +258,22 @@ class ComprehensiveMoleculeValidator:
             'c_error_percent': abs(c_count - expected_c) / max(expected_c, 1) * 100
         }
         
-        # Calculate score based on accuracy
+        # VERY LENIENT SCORING for H/C counts
         h_accuracy = 1.0 - (details['h_error'] / max(expected_h, 1))
         c_accuracy = 1.0 - (details['c_error'] / max(expected_c, 1))
         
-        # Perfect match bonus
+        # Lenient scoring thresholds
         if details['h_error'] == 0 and details['c_error'] == 0:
             score = 10.0  # Perfect match
-        elif details['h_error'] <= 1 and details['c_error'] <= 1:
-            score = 8.0   # Near perfect (off by 1)
-        elif details['h_error_percent'] <= 10 and details['c_error_percent'] <= 10:
-            score = 6.0   # Good match (within 10%)
-        elif details['h_error_percent'] <= 25 and details['c_error_percent'] <= 25:
-            score = 4.0   # Acceptable match (within 25%)
+        elif details['h_error'] <= 2 and details['c_error'] <= 1:
+            score = 9.0   # Near perfect
+        elif details['h_error_percent'] <= 20 and details['c_error_percent'] <= 20:
+            score = 7.0   # Good match (within 20%)
+        elif details['h_error_percent'] <= 40 and details['c_error_percent'] <= 40:
+            score = 5.0   # Partial match (within 40%)
         else:
-            score = 2.0 * (h_accuracy + c_accuracy)  # Poor match
+            # Still give credit for any carbon/hydrogen presence
+            score = 3.0 + (h_accuracy + c_accuracy)  # Base score of 3
         
         details['combined_accuracy'] = (h_accuracy + c_accuracy) / 2
         
@@ -287,17 +316,17 @@ class ComprehensiveMoleculeValidator:
 
 
 class EnhancedRewardAwareLoss(nn.Module):
-    """Enhanced loss function with comprehensive reward/penalty system including token accuracy rewards"""
+    """Enhanced loss function with validity-first priority and stable training"""
     
     def __init__(self, base_criterion, validator: ComprehensiveMoleculeValidator,
-                 base_loss_weight=0.2, reward_weight=0.5, token_accuracy_weight=0.3):
+                 base_loss_weight=0.3, reward_weight=0.4, token_accuracy_weight=0.3):
         """
         Args:
             base_criterion: Base loss function (CrossEntropyLoss)
             validator: Comprehensive molecule validator
-            base_loss_weight: Weight for base token loss (0.2 = 20%)
-            reward_weight: Weight for reward/penalty system (0.5 = 50%)
-            token_accuracy_weight: Weight for token accuracy rewards (0.3 = 30%)
+            base_loss_weight: Weight for base token loss (0.3)
+            reward_weight: Weight for validity/reward system (0.4 - highest)
+            token_accuracy_weight: Weight for token accuracy rewards (0.3)
         """
         super().__init__()
         self.base_criterion = base_criterion
@@ -314,13 +343,7 @@ class EnhancedRewardAwareLoss(nn.Module):
     
     def forward(self, outputs, targets, predictions=None, nmr_data=None):
         """
-        Calculate enhanced loss with comprehensive reward/penalty system + token accuracy rewards
-        
-        Args:
-            outputs: Model logits [batch, seq_len, vocab_size]
-            targets: Target token ids [batch, seq_len]
-            predictions: Generated SMILES strings
-            nmr_data: NMR data with expected H and C counts
+        Calculate enhanced loss with validity-first priority
         """
         # Base token-level loss
         base_loss = self.base_criterion(
@@ -328,7 +351,7 @@ class EnhancedRewardAwareLoss(nn.Module):
             targets.reshape(-1)
         )
         
-        # Calculate token accuracy rewards
+        # Calculate token accuracy rewards (HIGH PRIORITY)
         token_accuracy_reward, token_accuracy_score = self._calculate_token_accuracy_reward(outputs, targets)
         
         loss_components = {
@@ -356,7 +379,7 @@ class EnhancedRewardAwareLoss(nn.Module):
                 'total_reward': 0.0,
                 'total_penalty': 0.0,
                 'token_accuracy_scores': [],
-                'synergy_bonuses': 0  # NEW: Track when token accuracy + H/C match both high
+                'synergy_bonuses': 0
             }
             
             for i, pred_smiles in enumerate(predictions):
@@ -364,7 +387,7 @@ class EnhancedRewardAwareLoss(nn.Module):
                 expected_h = nmr_data['h_atoms'][i] if 'h_atoms' in nmr_data else 0
                 expected_c = nmr_data['c_atoms'][i] if 'c_atoms' in nmr_data else 0
                 
-                # Comprehensive evaluation
+                # Comprehensive evaluation with validity priority
                 evaluation = self.validator.comprehensive_evaluation(
                     pred_smiles, expected_h, expected_c
                 )
@@ -374,7 +397,7 @@ class EnhancedRewardAwareLoss(nn.Module):
                 evaluation['token_accuracy'] = sample_token_accuracy
                 stats['token_accuracy_scores'].append(sample_token_accuracy)
                 
-                # SYNERGY BONUS: Reward when both token accuracy and H/C matching are high
+                # Validity-focused synergy bonus
                 synergy_bonus = self._calculate_synergy_bonus(evaluation, sample_token_accuracy)
                 evaluation['synergy_bonus'] = synergy_bonus
                 if synergy_bonus > 0:
@@ -406,21 +429,24 @@ class EnhancedRewardAwareLoss(nn.Module):
             avg_molecule_score = total_molecule_score / batch_size
             avg_token_accuracy = sum(stats['token_accuracy_scores']) / batch_size
             
-            # Convert rewards to loss terms (negative rewards become positive loss)
-            molecule_reward_loss = -avg_molecule_score  # Negative because rewards should decrease loss
-            token_accuracy_loss = -token_accuracy_reward  # Token accuracy as loss component
+            # LINEAR SCALING for stable training (no exponential)
+            molecule_reward_loss = -avg_molecule_score / 20.0  # Scale down rewards
+            token_accuracy_loss = -token_accuracy_reward / 10.0  # Scale down token rewards
             
-            # Combined loss with all three components
+            # Combined loss with stability
             total_loss = (
                 self.base_loss_weight * base_loss +
                 self.reward_weight * molecule_reward_loss +
                 self.token_accuracy_weight * token_accuracy_loss
             )
             
+            # CLAMP LOSS to prevent negative values
+            total_loss = torch.clamp(total_loss, min=0.01)
+            
             # Store detailed information
             loss_components.update({
                 'molecule_reward_penalty_sum': avg_molecule_score,
-                'molecule_reward_loss': molecule_reward_loss,
+                'molecule_reward_loss': molecule_reward_loss.item() if torch.is_tensor(molecule_reward_loss) else molecule_reward_loss,
                 'token_accuracy_loss': token_accuracy_loss,
                 'detailed_scores': detailed_evaluations,
                 'batch_stats': stats,
@@ -438,35 +464,42 @@ class EnhancedRewardAwareLoss(nn.Module):
             return total_loss, loss_components
         
         # If no predictions available, still include token accuracy
-        token_accuracy_loss = -token_accuracy_reward
+        token_accuracy_loss = -token_accuracy_reward / 10.0
         total_loss = (
-            (self.base_loss_weight + self.reward_weight) * base_loss +  # Redistribute weights
+            (self.base_loss_weight + self.reward_weight) * base_loss +
             self.token_accuracy_weight * token_accuracy_loss
         )
+        
+        # Clamp to prevent negative
+        total_loss = torch.clamp(total_loss, min=0.01)
         
         return total_loss, loss_components
     
     def _calculate_token_accuracy_reward(self, outputs, targets):
-        """Calculate token accuracy reward with graduated bonuses"""
+        """Calculate token accuracy reward (HIGH PRIORITY)"""
         predictions = outputs.argmax(dim=-1)
         correct_tokens = (predictions == targets).float()
         
         # Calculate accuracy
         token_accuracy = correct_tokens.mean()
         
-        # Graduated rewards for token accuracy
+        # Strong rewards for token accuracy (second priority)
         if token_accuracy > 0.95:
-            reward = 8.0    # Excellent accuracy
+            reward = 10.0
         elif token_accuracy > 0.90:
-            reward = 6.0    # Very good accuracy
+            reward = 8.0
         elif token_accuracy > 0.85:
-            reward = 4.0    # Good accuracy
+            reward = 6.0
         elif token_accuracy > 0.80:
-            reward = 2.0    # Decent accuracy
+            reward = 4.0
         elif token_accuracy > 0.70:
-            reward = 1.0    # Basic accuracy
+            reward = 2.0
+        elif token_accuracy > 0.60:
+            reward = 1.0
+        elif token_accuracy > 0.50:
+            reward = 0.5
         else:
-            reward = 0.0    # Poor accuracy
+            reward = 0.0
         
         return reward, token_accuracy.item()
     
@@ -478,161 +511,91 @@ class EnhancedRewardAwareLoss(nn.Module):
     
     def _calculate_synergy_bonus(self, evaluation, token_accuracy):
         """
-        Calculate synergy bonus when both token accuracy and molecular properties are good
-        This encourages the model to achieve both good syntax AND good chemistry
+        Calculate synergy bonus focusing on validity + token accuracy
         """
-        # Check if molecule has good H/C matching
-        has_good_hc = ('perfect_hc_match' in evaluation['rewards'] or 
-                      'good_hc_match' in evaluation['rewards'])
-        
-        # Check if molecule is valid
+        # Check if molecule is valid (highest priority)
         is_valid = 'valid_molecule' in evaluation['rewards']
+        has_good_structure = 'reasonable_structure' in evaluation['rewards']
+        has_any_hc_match = any(key in evaluation['rewards'] for key in ['perfect_hc_match', 'good_hc_match', 'partial_hc_match'])
         
-        # High token accuracy threshold
-        high_token_accuracy = token_accuracy > 0.85
+        # Token accuracy thresholds
+        high_token_accuracy = token_accuracy > 0.80
+        good_token_accuracy = token_accuracy > 0.70
+        decent_token_accuracy = token_accuracy > 0.60
         
-        # Synergy bonuses
-        if has_good_hc and is_valid and high_token_accuracy:
-            if 'perfect_hc_match' in evaluation['rewards']:
-                return 5.0  # Perfect synergy: perfect H/C + valid + high token accuracy
-            else:
-                return 3.0  # Good synergy: good H/C + valid + high token accuracy
-        elif has_good_hc and high_token_accuracy:
-            return 2.0  # Partial synergy: good H/C + high token accuracy
-        elif is_valid and high_token_accuracy:
-            return 1.0  # Basic synergy: valid + high token accuracy
+        # Validity-focused synergy bonuses
+        if is_valid and high_token_accuracy:
+            return 8.0  # Strong bonus for valid + high accuracy
+        elif is_valid and good_token_accuracy:
+            return 5.0  # Good bonus for valid + good accuracy
+        elif is_valid and decent_token_accuracy:
+            return 3.0  # Moderate bonus
+        elif is_valid:
+            return 2.0  # Bonus just for validity
+        elif high_token_accuracy:
+            return 1.0  # Small bonus for high accuracy alone
         
-        return 0.0  # No synergy bonus
+        return 0.0
 
 
 def create_comprehensive_system(model, tokenizer, device='cuda'):
-    """Create comprehensive reward/penalty system with token accuracy integration"""
+    """Create comprehensive reward/penalty system with VALIDITY-FIRST priority"""
     
-    # Create comprehensive validator with strict H/C tolerance
-    validator = ComprehensiveMoleculeValidator(hc_count_tolerance=0.05)  # 5% tolerance
+    # Create comprehensive validator with lenient H/C tolerance
+    validator = ComprehensiveMoleculeValidator(hc_count_tolerance=0.1)  # 10% tolerance
     
-    # Create enhanced loss with balanced focus on all components
+    # Create enhanced loss with validity-first weights
     base_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     enhanced_loss = EnhancedRewardAwareLoss(
         base_criterion,
         validator,
-        base_loss_weight=0.2,      # 20% base token loss
-        reward_weight=0.5,         # 50% molecule reward/penalty system
-        token_accuracy_weight=0.3  # 30% token accuracy rewards (NEW)
+        base_loss_weight=0.3,      # Base token loss
+        reward_weight=0.4,         # Highest - validity priority
+        token_accuracy_weight=0.3  # High - token accuracy important
     )
     
     return validator, enhanced_loss
 
 
-def test_comprehensive_system_with_token_accuracy():
-    """Test the comprehensive reward/penalty system including token accuracy"""
+# Test the system
+if __name__ == "__main__":
+    print("Testing Validity-First Reward System")
+    print("=" * 60)
+    
     validator = ComprehensiveMoleculeValidator()
     
-    # Create mock outputs and targets for token accuracy testing
-    import torch
-    batch_size, seq_len, vocab_size = 2, 10, 100
-    
-    # Mock high accuracy case
-    outputs_high_acc = torch.randn(batch_size, seq_len, vocab_size)
-    targets = torch.randint(0, vocab_size, (batch_size, seq_len))
-    
-    # Make outputs match targets for high accuracy
-    for i in range(batch_size):
-        for j in range(seq_len):
-            outputs_high_acc[i, j, targets[i, j]] = 10.0  # High logit for correct token
-    
-    # Mock low accuracy case
-    outputs_low_acc = torch.randn(batch_size, seq_len, vocab_size)
-    
     test_cases = [
-        # High token accuracy + perfect H/C match
-        {
-            "smiles": "CCO", 
-            "expected_h": 6, 
-            "expected_c": 2, 
-            "outputs": outputs_high_acc[0:1],
-            "targets": targets[0:1],
-            "name": "High token accuracy + Perfect H/C"
-        },
-        # High token accuracy + invalid molecule  
-        {
-            "smiles": "CCC(C)C(C)", 
-            "expected_h": 14, 
-            "expected_c": 6,
-            "outputs": outputs_high_acc[0:1], 
-            "targets": targets[0:1],
-            "name": "High token accuracy + Invalid molecule"
-        },
-        # Low token accuracy + perfect H/C match
-        {
-            "smiles": "CCO", 
-            "expected_h": 6, 
-            "expected_c": 2,
-            "outputs": outputs_low_acc[0:1],
-            "targets": targets[0:1], 
-            "name": "Low token accuracy + Perfect H/C"
-        },
-        # Empty prediction case
-        {
-            "smiles": "", 
-            "expected_h": 6, 
-            "expected_c": 2,
-            "outputs": outputs_low_acc[0:1],
-            "targets": targets[0:1],
-            "name": "Empty prediction"
-        }
+        {"smiles": "CCO", "expected_h": 6, "expected_c": 2, "name": "Ethanol (perfect)"},
+        {"smiles": "CCCO", "expected_h": 8, "expected_c": 3, "name": "Propanol (perfect)"},
+        {"smiles": "CCO", "expected_h": 8, "expected_c": 3, "name": "Ethanol (wrong H/C)"},
+        {"smiles": "C", "expected_h": 4, "expected_c": 1, "name": "Methane (perfect)"},
+        {"smiles": "", "expected_h": 6, "expected_c": 2, "name": "Empty"},
+        {"smiles": "CC(C)C", "expected_h": 10, "expected_c": 4, "name": "Isobutane (perfect)"},
+        {"smiles": "CC(X)C", "expected_h": 10, "expected_c": 4, "name": "Invalid SMILES"},
     ]
-    
-    print("Comprehensive System Test with Token Accuracy Integration")
-    print("=" * 70)
     
     for test in test_cases:
         print(f"\nTest: {test['name']}")
         print(f"SMILES: '{test['smiles']}'")
         print(f"Expected H/C: {test['expected_h']}/{test['expected_c']}")
         
-        # Test molecular evaluation
         evaluation = validator.comprehensive_evaluation(
             test['smiles'], test['expected_h'], test['expected_c']
         )
         
-        # Test token accuracy
-        predictions = test['outputs'].argmax(dim=-1)
-        correct_tokens = (predictions == test['targets']).float()
-        token_accuracy = correct_tokens.mean().item()
+        print(f"Total Score: {evaluation['total_score']:.2f}")
+        print(f"Rewards: {sum(evaluation['rewards'].values()):.2f}")
+        print(f"Penalties: {sum(evaluation['penalties'].values()):.2f}")
         
-        # Test synergy bonus
-        loss_fn = EnhancedRewardAwareLoss(
-            torch.nn.CrossEntropyLoss(), 
-            validator,
-            base_loss_weight=0.2,
-            reward_weight=0.5, 
-            token_accuracy_weight=0.3
-        )
-        synergy_bonus = loss_fn._calculate_synergy_bonus(evaluation, token_accuracy)
-        
-        print(f"Token Accuracy: {token_accuracy*100:.1f}%")
-        print(f"Molecule Score: {evaluation['total_score']:.2f}")
-        print(f"Synergy Bonus: {synergy_bonus:.2f}")
-        print(f"Combined Benefit: {evaluation['total_score'] + synergy_bonus:.2f}")
-        
-        if evaluation['issues']:
-            print(f"Issues: {', '.join(evaluation['issues'])}")
-        if evaluation['successes']:
-            print(f"Successes: {', '.join(evaluation['successes'])}")
-        
-        # Show what the model learns
-        if token_accuracy > 0.85 and synergy_bonus > 0:
-            print("✓ MODEL LEARNS: High token accuracy + good chemistry = BIG REWARD!")
-        elif token_accuracy > 0.85:
-            print("→ MODEL LEARNS: Good syntax but need better chemistry")
-        elif synergy_bonus > 0:
-            print("→ MODEL LEARNS: Good chemistry but need better syntax")
+        # Show validity status prominently
+        if 'valid_molecule' in evaluation['rewards']:
+            print("✓ VALID MOLECULE")
         else:
-            print("✗ MODEL LEARNS: Need improvement in both syntax and chemistry")
+            print("✗ INVALID MOLECULE")
         
-        print("-" * 50)
-
-
-if __name__ == "__main__":
-    test_comprehensive_system_with_token_accuracy()
+        if evaluation['successes']:
+            print(f"Successes: {', '.join(evaluation['successes'][:2])}")
+        if evaluation['issues']:
+            print(f"Issues: {', '.join(evaluation['issues'][:2])}")
+        
+        print("-" * 40)

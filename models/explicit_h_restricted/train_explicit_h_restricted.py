@@ -28,7 +28,7 @@ MODEL_CONFIG = {
     'validity_weight': 1.0,  # Increased from 0.5 for stronger enforcement
     'learning_rate': 1e-5,   # Lower learning rate for stability
     'batch_size': 8,         # Smaller batch size for better learning
-    'num_epochs': 20,       # More epochs
+    'num_epochs': 25,       # More epochs
     'temperature': 0.7,      # Lower temperature for more conservative generation
     
     # Additional parameters for better training
